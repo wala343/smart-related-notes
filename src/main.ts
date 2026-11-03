@@ -59,8 +59,40 @@ import {
   IndexStore,
   stripMarkdown,
   type IndexStoreOptions,
+  type IndexStatus,
   type VaultInsights,
 } from "./index-store";
+import {
+  type TagRewriteProposal,
+  type TaxonomyResult,
+} from "./tagging/proposal";
+import type { ApplyFrontmatterPort } from "./tagging/apply";
+import type { LedgerStoragePort } from "./tagging/ledger";
+import {
+  type TaggingCommandPort,
+  applySelectedProposals,
+  filterAdditiveProposals,
+  previewTaxonomy,
+  revertTagChanges,
+} from "./tagging/commands";
+import { detectNormalization, detectPlacement } from "./tagging/detectors";
+import {
+  computeInlineRewrite,
+  type InlineRewriteAccess,
+} from "./tagging/inline-rewrite";
+import { renderProposalSection, renderTaxonomySection } from "./tagging/insights-bridge";
+import { jsonFileLedgerStorage, obsidianFrontmatterPort } from "./tagging/obsidian-ports";
+import { buildTaxonomy } from "./tagging/taxonomy";
+import {
+  NAMING_REQUEST_TIMEOUT_MS,
+  applyModelNaming,
+  boundedNamingRequest,
+  excerptNoteText,
+  namingCacheKey,
+  namingTransportFrom,
+  providerSelectionFrom,
+} from "./tagging/naming-bridge";
+import { renderTaxonomyPreview } from "./tagging/taxonomy-report";
 import { RelatedNotesView, VIEW_TYPE_RELATED } from "./view";
 import { VaultMapView, VIEW_TYPE_MAP } from "./map-view";
 import { TitleIndex } from "./title-index";
@@ -143,6 +175,15 @@ export interface RelatedNotesSettings {
   readerPace: ReaderPace; // idle reading cadence
   readerOneLiners: boolean; // reader one-liner replaces the keyphrase label line
   readerSuggestTags: boolean; // ghost tag chips on the active note
+  // --- concept tagging ---
+  conceptTaggingEnabled: boolean; // gate for the four tagging commands + the idle auto-apply
+  autoApplyConceptTags: boolean; // idle apply after edits; OFF default: bulk mutation is never on by default
+  conceptTagMinConfidence: number; // proposals below this (0..1) never assemble
+  // --- concept tagging: model naming (opt-in pass over the finished local taxonomy) ---
+  conceptNamingMode: "local" | "openai-compatible"; // local names on this machine; the other mode asks the endpoint below
+  conceptNamingEndpoint: string; // full chat/completions URL, hosted or local
+  conceptNamingModel: string; // model id to ask for the renames
+  conceptNamingApiKey: string; // bearer token; "" => no Authorization header
 }
 
 export const DEFAULT_SETTINGS: RelatedNotesSettings = {
@@ -200,6 +241,13 @@ export const DEFAULT_SETTINGS: RelatedNotesSettings = {
   readerPace: "balanced",
   readerOneLiners: true,
   readerSuggestTags: true,
+  conceptTaggingEnabled: true,
+  autoApplyConceptTags: false,
+  conceptTagMinConfidence: 0.6,
+  conceptNamingMode: "local",
+  conceptNamingEndpoint: "",
+  conceptNamingModel: "",
+  conceptNamingApiKey: "",
 };
 
 // A few vetted model ids surfaced as a dropdown so users don't have to memorise
@@ -303,6 +351,29 @@ export default class RelatedNotesPlugin extends Plugin {
   // Idle auto-link-subsequent pass for the active file (opt-in; ~3s after the
   // last edit). Lighter + separate from the 20s re-embed debounce.
   private debouncedAutoLink!: Debouncer<[string], void>;
+  // Idle concept-tag auto-apply for the changed note (opt-in; ~3s after the
+  // last edit), the same debouncedAutoLink pattern.
+  private debouncedAutoApplyConceptTags!: Debouncer<[string], void>;
+
+  // --- concept taxonomy cache ---
+  // The plugin's current TaxonomyResult plus its freshness key. The persisted
+  // index exposes no mtime on the store's public surface, so the key is the
+  // generation of the store's load/build completion transitions (indexEpoch).
+  private conceptTaxonomy: TaxonomyResult | null = null;
+  private conceptTaxonomyIndexMtime: number | null = null;
+  // The naming settings the cached taxonomy was produced under: the cache holds
+  // only while BOTH this and the index epoch still match the settings.
+  private conceptTaxonomyNamingKey: string | null = null;
+  // Reader-host memo: note path -> taxonomy leaf + proposal tag paths. Emptied
+  // whenever the taxonomy is invalidated or recomputed.
+  private conceptTagCandidates: Map<string, string[]> | null = null;
+  private indexEpoch = 0;
+  private lastIndexProgressStatus: IndexStatus = "idle";
+  // Self-write suppression: the count of in-flight tagging-pipeline write
+  // sequences (commands + auto-apply). The modify handler's auto-apply arm
+  // skips while non-zero, so a write's own modify event — a revert's especially
+  // — never re-arms the debouncer. Counter (not a flag): runs may overlap.
+  private taggingWritesInFlight = 0;
 
   // The model id / device preference the current engine was built for. Compared
   // against settings on save to decide whether a re-embed is actually needed —
@@ -397,6 +468,15 @@ export default class RelatedNotesPlugin extends Plugin {
     // debounced (300ms) in the view, so a batch of resolving labels collapses into
     // one render pass — mirroring getSnippet's coalescing.
     this.store.setRenderHook(() => this.getView()?.requestRender());
+    // The concept-taxonomy freshness key follows the index lifecycle: leaving
+    // ready drops everything derived from the old index, arriving at ready
+    // (a load/build completion) starts the generation the cache is keyed to.
+    this.store.onProgress((p) => {
+      if (p.status === this.lastIndexProgressStatus) return;
+      this.lastIndexProgressStatus = p.status;
+      if (p.status === "ready") this.indexEpoch += 1;
+      if (p.status !== "idle") this.invalidateConceptTaxonomy();
+    });
     // Idle auto-unload: free the engine's memory after a quiet period.
     this.applyEngineIdlePolicy();
 
@@ -465,6 +545,46 @@ export default class RelatedNotesPlugin extends Plugin {
       },
     });
 
+    // --- concept tagging: the pipeline's command surface -----------------------
+    // The two apply commands are review-first: they open ConceptTagReviewModal
+    // with the assembled list and apply NOTHING until its Apply selected returns.
+    this.addCommand({
+      id: "apply-suggested-tags-note",
+      name: "Apply suggested tags to this note",
+      callback: () => {
+        const file = this.app.workspace.getActiveFile();
+        if (!file) {
+          new Notice("Concept tags: no active note.");
+          return;
+        }
+        void this.reviewConceptTags(file);
+      },
+    });
+
+    this.addCommand({
+      id: "apply-suggested-tags-vault",
+      name: "Apply suggested tags across the vault",
+      callback: () => {
+        void this.reviewConceptTags();
+      },
+    });
+
+    this.addCommand({
+      id: "preview-concept-taxonomy",
+      name: "Preview the concept taxonomy",
+      callback: () => {
+        void this.runTaggingCommand(previewTaxonomy);
+      },
+    });
+
+    this.addCommand({
+      id: "revert-tag-changes",
+      name: "Revert applied tag changes",
+      callback: () => {
+        void this.runTaggingCommand(revertTagChanges);
+      },
+    });
+
     // --- Feature A: inline glow + 1-click link -------------------------------
     // Seed the module-scoped bridge the ViewPlugin reads, then register the CM6
     // extension. @codemirror/* is externalized so this uses Obsidian's singleton.
@@ -514,6 +634,13 @@ export default class RelatedNotesPlugin extends Plugin {
       false,
     );
 
+    // --- idle concept-tag auto-apply (opt-in) -------------------------------
+    this.debouncedAutoApplyConceptTags = debounce(
+      (path: string) => void this.autoApplyConceptTags(path),
+      3000,
+      false,
+    );
+
     // --- incremental index maintenance ---------------------------------------
     // 20s idle before re-embedding a changed note: typing (and the short pauses
     // while typing) never kicks off embeddings — only a real edit pause does.
@@ -533,6 +660,17 @@ export default class RelatedNotesPlugin extends Plugin {
             file.path === this.app.workspace.getActiveFile()?.path
           ) {
             this.debouncedAutoLink(file.path);
+          }
+          // Idle concept-tag auto-apply for the changed note (opt-in). Unlike
+          // auto-link it is not cursor-bound; the undo ledger makes it revertible.
+          // The in-flight counter is the self-write guard: a tagging pipeline
+          // write's own modify event (a revert's above all) must not re-arm.
+          if (
+            this.settings.conceptTaggingEnabled &&
+            this.settings.autoApplyConceptTags &&
+            this.taggingWritesInFlight === 0
+          ) {
+            this.debouncedAutoApplyConceptTags(file.path);
           }
         }
       }),
@@ -633,6 +771,7 @@ export default class RelatedNotesPlugin extends Plugin {
     this.debouncedUpdate?.cancel();
     this.debouncedTitleRefresh?.cancel();
     this.debouncedAutoLink?.cancel();
+    this.debouncedAutoApplyConceptTags?.cancel();
     // Stop any in-flight build/flush/label loop, then terminate the engine's
     // worker realm (terminal: post-dispose calls reject instead of respawning).
     this.store?.close();
@@ -763,6 +902,17 @@ export default class RelatedNotesPlugin extends Plugin {
         if (!(f instanceof TFile)) return Promise.resolve([]);
         return Promise.resolve(this.store.rank(f).slice(0, k).map((r) => r.file.path));
       },
+      // PascalCase concept paths for the note: its taxonomy leaf first, then
+      // its detector proposals' tag paths (ci-deduped). [] while no taxonomy
+      // has been computed; memoized per taxonomy generation.
+      taxonomyCandidates: (path) => this.conceptTagCandidatesFor(path),
+      // The note's store-gated neighbour tag votes, mapped 1:1 (the store
+      // already returns lowercased {tag, support, voters} rows).
+      tagNeighbours: (path) => {
+        const f = this.app.vault.getAbstractFileByPath(path);
+        if (!(f instanceof TFile)) return [];
+        return this.store.suggestedTagNeighbours(f);
+      },
       recentPaths: () => this.app.workspace.getLastOpenFiles(),
       indexBusy: () => {
         const s = this.store.getProgress().status;
@@ -835,6 +985,9 @@ export default class RelatedNotesPlugin extends Plugin {
       this.settings.modelChosen = true;
       await this.saveSettings();
     }
+    // A full rebuild replaces the pool the taxonomy was computed over: drop it
+    // and everything derived from it (the ready-transition bumps the key).
+    this.invalidateConceptTaxonomy();
     await this.store.build(undefined, true);
     this.getView()?.requestRender();
   }
@@ -847,7 +1000,9 @@ export default class RelatedNotesPlugin extends Plugin {
     new Notice("Smart Related Notes: computing vault insights...");
     let insights: VaultInsights;
     try {
-      insights = this.store.computeInsights(new Set([path]));
+      // Carry the concept taxonomy along so the pipeline's two bridge sections
+      // render; an empty result (index not loaded) leaves both sections out.
+      insights = this.store.computeInsights(new Set([path]), await this.currentTaxonomy());
     } catch (e) {
       new Notice(`Vault insights failed: ${(e as Error).message}`);
       return;
@@ -921,6 +1076,10 @@ export default class RelatedNotesPlugin extends Plugin {
            ...table(["Note", "Tag", "Neighbours agreeing"],
              ins.suggestedTags.map((x) => [wl(x.path), `#${x.tag}`, `${x.support} of ${x.neighbors}`]))], false);
 
+    // The concept-tag pipeline's pending rewrites continue the Suggested tags
+    // callout; the bridge yields [] when there are none, so no empty section.
+    for (const line of renderProposalSection(ins.conceptProposals)) L.push(line);
+
     cal("warning", `Orphans (${ins.orphans.length})`,
       ins.orphans.length === 0
         ? ["None. Every note is connected to something."]
@@ -941,6 +1100,9 @@ export default class RelatedNotesPlugin extends Plugin {
         : ["The oldest edits in the vault. Not a problem, just the part you have stopped looking at.", "",
            ...table(["Note", "Last edited"], ins.stale.map((x) => [wl(x.path), ymd(x.mtime)]))], false);
 
+    // The concept taxonomy as the report's final section; [] without a taxonomy.
+    for (const line of renderTaxonomySection(ins.taxonomyPreview)) L.push(line);
+
     return L.join("\n");
   }
 
@@ -959,6 +1121,264 @@ export default class RelatedNotesPlugin extends Plugin {
       if (file instanceof TFile) await this.store.updateFile(file);
     }
     this.getView()?.requestRender();
+  }
+
+  // --- concept tagging -------------------------------------------------------
+  // Same loaded-state gate the panel uses: the pipeline never touches an index
+  // that has not finished loading/building.
+  private indexReady(): boolean {
+    return this.store.getProgress().status === "ready";
+  }
+
+  // Drop the taxonomy and everything derived from it; the freshness key itself
+  // changes on the store's load/build completion transitions (onload listener).
+  private invalidateConceptTaxonomy(): void {
+    this.conceptTaxonomy = null;
+    this.conceptTaxonomyIndexMtime = null;
+    this.conceptTaxonomyNamingKey = null;
+    this.conceptTagCandidates = null;
+  }
+
+  // Compute-on-demand over the loaded index: the vault map's note set plus a
+  // one-time body read for the taxonomy's c-TF-IDF corpus. The cache is keyed
+  // by the index generation AND the naming settings, so a rebuild — or a change
+  // to the naming mode, endpoint or model — forces exactly one recompute.
+  private async currentTaxonomy(): Promise<TaxonomyResult> {
+    if (!this.indexReady()) return { nodes: [], leafAssignment: new Map() };
+    const namingKey = namingCacheKey(
+      this.settings.conceptNamingMode,
+      this.settings.conceptNamingEndpoint,
+      this.settings.conceptNamingModel,
+      this.settings.conceptNamingApiKey !== "",
+    );
+    if (
+      this.conceptTaxonomy &&
+      this.conceptTaxonomyIndexMtime === this.indexEpoch &&
+      this.conceptTaxonomyNamingKey === namingKey
+    ) {
+      return this.conceptTaxonomy;
+    }
+    const notes = this.store.vaultMapInput();
+    const bodies = new Map<string, string>();
+    await Promise.all(
+      notes.map(async (n) => {
+        const f = this.app.vault.getAbstractFileByPath(n.path);
+        if (!(f instanceof TFile)) return; // deleted mid-read: title alone names its cluster
+        try {
+          bodies.set(n.path, stripMarkdown(await this.app.vault.cachedRead(f)));
+        } catch {
+          // unreadable: title alone, same as a deleted note
+        }
+      }),
+    );
+    const local = buildTaxonomy(notes, (path) => bodies.get(path) ?? "");
+    const selection = providerSelectionFrom(
+      this.settings.conceptNamingMode,
+      this.settings.conceptNamingEndpoint,
+      this.settings.conceptNamingModel,
+      this.settings.conceptNamingApiKey,
+    );
+    // The SAME note paths the local build read; the provider caps excerpts further.
+    const context = notes.map((n) => ({
+      path: n.path,
+      title: n.title,
+      text: excerptNoteText(bodies.get(n.path) ?? ""),
+    }));
+    const outcome = await applyModelNaming(
+      local,
+      context,
+      selection,
+      boundedNamingRequest(namingTransportFrom(requestUrl), NAMING_REQUEST_TIMEOUT_MS),
+    );
+    if (outcome.failure !== undefined) new Notice(outcome.failure); // once per failed attempt; the local taxonomy serves on
+    // The renamed taxonomy (provider-validated: same membership, order, levels,
+    // depth) feeds everything downstream unchanged; replacements stay modal-gated.
+    this.conceptTaxonomy = outcome.taxonomy;
+    this.conceptTaxonomyIndexMtime = this.indexEpoch;
+    this.conceptTaxonomyNamingKey = namingKey;
+    this.conceptTagCandidates = null; // the detector memo follows the taxonomy
+    return outcome.taxonomy;
+  }
+
+  // The pipeline's one composition: taxonomy → computeInsights (which already
+  // sequences taxonomy → detectors → neighbour vote into conceptProposals —
+  // the wiring does NOT run the detectors for proposals itself) → confidence
+  // floor → optional per-note filter. Vault-wide compute once per invocation.
+  private async assembleTagProposals(file?: TFile): Promise<TagRewriteProposal[]> {
+    if (!this.indexReady()) return [];
+    const taxonomy = await this.currentTaxonomy();
+    const insights = this.store.computeInsights(new Set(), taxonomy);
+    const kept = insights.conceptProposals.filter(
+      (p) => p.confidence >= this.settings.conceptTagMinConfidence,
+    );
+    return file ? kept.filter((p) => p.notePath === file.path) : kept;
+  }
+
+  // Reader-host member: the note's taxonomy leaf, then the tag paths of its
+  // placement/normalization proposals in detector order, ci-deduped keeping
+  // the first (PascalCase) rendering — leaf first. Memoized per generation.
+  private conceptTagCandidatesFor(path: string): string[] {
+    if (!this.conceptTaxonomy) return []; // nothing computed yet
+    return this.conceptTagCandidateMemo().get(path) ?? [];
+  }
+
+  private conceptTagCandidateMemo(): Map<string, string[]> {
+    if (this.conceptTagCandidates) return this.conceptTagCandidates;
+    const taxonomy = this.conceptTaxonomy;
+    const memo = new Map<string, string[]>();
+    if (!taxonomy) return memo; // not stored: an empty memo must not outlive the gate
+    const inventory = this.store.tagInventory(); // the store's own census: eligible notes, shared pool, exact forms
+    const add = (notePath: string, tagPath: string): void => {
+      const list = memo.get(notePath);
+      if (!list) memo.set(notePath, [tagPath]);
+      else if (!list.some((t) => t.toLowerCase() === tagPath.toLowerCase())) list.push(tagPath);
+    };
+    for (const [notePath, leaf] of taxonomy.leafAssignment) add(notePath, leaf);
+    for (const p of detectPlacement(taxonomy, inventory)) add(p.notePath, p.tagPath);
+    for (const p of detectNormalization(taxonomy, inventory)) add(p.notePath, p.tagPath);
+    this.conceptTagCandidates = memo;
+    return memo;
+  }
+
+  // The four commands' one port over live plugin state, built per invocation so
+  // settings and index changes need no re-wiring. The undo ledger lives in the
+  // plugin directory, beside reader-artifacts.json.
+  private taggingCommandPort(includeInlineChannel = true): TaggingCommandPort {
+    const frontmatter: ApplyFrontmatterPort = obsidianFrontmatterPort(this.app);
+    const adapter = this.app.vault.adapter;
+    const ledgerPath = normalizePath(`${this.pluginDir()}/tag-change-ledger.json`);
+    const ledgerStorage: LedgerStoragePort = jsonFileLedgerStorage({
+      exists: () => adapter.exists(ledgerPath),
+      read: () => adapter.read(ledgerPath),
+      write: (text) => adapter.write(ledgerPath, text),
+    });
+    const port: TaggingCommandPort = {
+      frontmatter,
+      ledgerStorage,
+      now: () => Date.now(),
+      ledgerRetentionDays: () => 0, // keep the whole journal: the vault has no git to fall back on
+      taxonomyPreviewLines: async () => renderTaxonomyPreview(await this.currentTaxonomy()),
+    };
+    // Present on the MANUAL port only: the review modal is the approved-rewrite
+    // path, and approved replacements also rename the note's inline #tags.
+    if (includeInlineChannel) port.inline = this.conceptInlineAccess();
+    return port;
+  }
+
+  // The inline rewrite access over metadataCache + vault. Spans come from the
+  // LIVE getFileCache(file).tags offsets, a cache that structurally excludes
+  // code fences, inline code, links and URLs — so no regex ever runs over note
+  // text anywhere in this wiring; computeInlineRewrite sees validated spans only.
+  private conceptInlineAccess(): InlineRewriteAccess {
+    const vault = this.app.vault;
+    const cache = this.app.metadataCache;
+    const asFile = (notePath: string): TFile | null => {
+      const f = vault.getAbstractFileByPath(notePath);
+      return f instanceof TFile ? f : null;
+    };
+    return {
+      readNoteContent: async (notePath) => {
+        const file = asFile(notePath);
+        if (!file) return null; // missing note: the access's null contract
+        try {
+          return await vault.cachedRead(file);
+        } catch {
+          return null; // unreadable reads veto (drift), never feed a mis-cut
+        }
+      },
+      writeNoteContent: async (notePath, text) => {
+        const file = asFile(notePath);
+        if (!file) throw new Error(`note-unavailable: ${notePath}`); // the pure layer routes this to a skip
+        await vault.process(file, () => text); // whole-content replacement through the vault's write channel
+      },
+      inlineTagSpans: async (notePath) => {
+        const file = asFile(notePath);
+        if (!(file instanceof TFile)) return []; // no file: no spans
+        return (cache.getFileCache(file)?.tags ?? []).map((t) => ({
+          start: t.position.start.offset,
+          end: t.position.end.offset,
+          text: t.tag, // the occurrence exactly as cached, "#" included
+        }));
+      },
+    };
+  }
+
+  // The conceptTaggingEnabled gate lives HERE, not in the pure command layer
+  // (order 0011 invariant 1), and one Notice surfaces the returned text.
+  private async runTaggingCommand(
+    run: (port: TaggingCommandPort) => Promise<string>,
+  ): Promise<void> {
+    if (!this.settings.conceptTaggingEnabled) {
+      new Notice("Concept tagging is disabled in settings.");
+      return;
+    }
+    // Self-write suppression: hold the window across the whole command run —
+    // every await in it can write note frontmatter (apply, revert). try/finally
+    // so a throw still releases the window.
+    this.taggingWritesInFlight += 1;
+    try {
+      new Notice(await run(this.taggingCommandPort()));
+    } catch (e) {
+      console.warn("[related-notes] concept tagging command failed", e);
+      new Notice("Related notes: concept tagging failed. See the console.");
+    } finally {
+      this.taggingWritesInFlight -= 1;
+    }
+  }
+
+  // B1: the two manual apply commands assemble, then OPEN the review modal —
+  // the approval surface for replacements (the insights report is only a
+  // preview). Nothing applies here; the modal's Apply selected does. The
+  // conceptTaggingEnabled gate lives in the wiring, as order 0011 pins.
+  private async reviewConceptTags(file?: TFile): Promise<void> {
+    if (!this.settings.conceptTaggingEnabled) {
+      new Notice("Concept tagging is disabled in settings.");
+      return;
+    }
+    try {
+      const proposals = await this.assembleTagProposals(file);
+      if (proposals.length === 0) {
+        new Notice("Concept tags: no proposals to review.");
+        return;
+      }
+      new ConceptTagReviewModal(this, proposals, this.conceptInlineAccess()).open();
+    } catch (e) {
+      console.warn("[related-notes] concept tagging review failed", e);
+      new Notice("Related notes: concept tagging failed. See the console.");
+    }
+  }
+
+  // The modal's Apply selected path: EXACTLY the ticked proposals (a group tick
+  // contributes every note instance it stands for), applied through
+  // runTaggingCommand so the self-write suppression window still wraps the
+  // apply and one Notice surfaces the result. Applying the selection is the
+  // review: what lands is journaled, and the next assembly no longer proposes it.
+  async applyReviewedProposals(selected: TagRewriteProposal[]): Promise<void> {
+    await this.runTaggingCommand((port) => applySelectedProposals(port, selected));
+  }
+
+  // Idle auto-apply for the changed note: its additive-only list (order 0011's
+  // filterAdditiveProposals — the LIST is the narrowing, not a flag, so no idle
+  // path can carry a replacesTag rewrite) goes to applySelectedProposals. The
+  // idle port passes NO inline member: without replacements there is nothing to
+  // rewrite inline. Silent by design (idle action; the ledger keeps it
+  // revertible). Replacements reach notes only through the manual commands'
+  // review modal — the insights report is a preview, not an approval surface.
+  private async autoApplyConceptTags(path: string): Promise<void> {
+    if (!this.settings.conceptTaggingEnabled || !this.settings.autoApplyConceptTags) return;
+    if (!this.indexReady()) return;
+    const file = this.app.vault.getAbstractFileByPath(path);
+    if (!(file instanceof TFile)) return; // deleted during the idle wait
+    const idlePort = this.taggingCommandPort(false); // idle path: port built with the inline channel excluded
+    this.taggingWritesInFlight += 1; // self-write suppression, as in runTaggingCommand
+    try {
+      const proposals = filterAdditiveProposals(await this.assembleTagProposals(file));
+      await applySelectedProposals(idlePort, proposals);
+    } catch (e) {
+      console.warn("[related-notes] concept-tag auto-apply failed", e);
+    } finally {
+      this.taggingWritesInFlight -= 1;
+    }
   }
 
   // --- link features: glow bridge + insertion --------------------------------
@@ -1569,6 +1989,31 @@ export class RelatedNotesSettingTab extends PluginSettingTab {
       );
   }
 
+  // A single-line text row, debounced-saved like every text setting here.
+  // `secret` renders it password-style: the value stays off the screen.
+  private textField(
+    host: HTMLElement,
+    name: string,
+    desc: string,
+    placeholder: string,
+    value: string,
+    apply: (v: string) => void,
+    secret = false,
+  ): void {
+    new Setting(host)
+      .setName(name)
+      .setDesc(desc)
+      .addText((t) => {
+        if (secret) t.inputEl.type = "password";
+        t.setPlaceholder(placeholder)
+          .setValue(value)
+          .onChange((v) => {
+            apply(v);
+            this.debouncedSave();
+          });
+      });
+  }
+
   private render(): void {
     const { containerEl } = this;
     containerEl.empty();
@@ -1593,6 +2038,7 @@ export class RelatedNotesSettingTab extends PluginSettingTab {
     this.section("Results panel", "results", (b) => this.buildResults(b));
     this.section("Reader", "reader", (b) => this.readerSection(b), "summaries tags model");
     this.section("Linking", "linking", (b) => this.buildLinking(b));
+    this.section("Concept tagging", "tagging", (b) => this.buildTagging(b));
     this.section("Scope", "scope", (b) => this.buildScope(b));
     this.section("Engine", "engine", (b) => this.buildEngine(b), "cached models");
     this.section("Advanced matching", "advanced", (b) => this.buildAdvanced(b));
@@ -1868,6 +2314,86 @@ export class RelatedNotesSettingTab extends PluginSettingTab {
         value: this.plugin.settings.newNoteMinSimilarity, def: 0.45,
       },
       (v) => (this.plugin.settings.newNoteMinSimilarity = v),
+    );
+  }
+
+  // --- Concept tagging: the concept-tag pipeline's user surface --------------
+  private buildTagging(host: HTMLElement): void {
+    this.toggle(
+      host,
+      "Enable concept tagging",
+      "The gate for the four tagging commands (apply this note, apply vault, preview taxonomy, revert changes). Off: each command just reports that tagging is disabled.",
+      this.plugin.settings.conceptTaggingEnabled,
+      (v) => (this.plugin.settings.conceptTaggingEnabled = v),
+      true,
+    );
+
+    this.toggle(
+      host,
+      "Auto-apply suggested tags while idle",
+      "About 3 seconds after you stop editing a note, merge that note's ADDITIVE concept-tag proposals (never rewrites) into its tags frontmatter. Rewrites land only through the apply commands' review modal. Bulk mutation is off by default; the Revert applied tag changes command undoes it.",
+      this.plugin.settings.autoApplyConceptTags,
+      (v) => (this.plugin.settings.autoApplyConceptTags = v),
+      false,
+    );
+
+    this.slider(
+      host,
+      "Minimum confidence",
+      "Proposals scoring below this never assemble or apply. Separator/casing renames are always confidence 1.",
+      {
+        min: 0,
+        max: 1,
+        step: 0.05,
+        value: this.plugin.settings.conceptTagMinConfidence, def: 0.6,
+      },
+      (v) => (this.plugin.settings.conceptTagMinConfidence = v),
+    );
+
+    // Opt-in model naming of the finished local taxonomy. Local stays the
+    // default and the fallback: any failure keeps it with one plain notice.
+    new Setting(host)
+      .setName("Taxonomy naming")
+      .setDesc(
+        "Local names tags on this machine, offline — the default. OpenAI-compatible additionally sends the tagged notes' titles and text excerpts to the endpoint you set below, and only in this mode. Any failure keeps the local names.",
+      )
+      .addDropdown((d) =>
+        d
+          .addOption("local", "Local (default, offline)")
+          .addOption("openai-compatible", "OpenAI-compatible model")
+          .setValue(this.plugin.settings.conceptNamingMode)
+          .onChange((v) => {
+            this.plugin.settings.conceptNamingMode = v as RelatedNotesSettings["conceptNamingMode"];
+            this.debouncedSave();
+          }),
+      );
+
+    this.textField(
+      host,
+      "Naming endpoint URL",
+      "Full chat/completions URL, hosted or local. Naming stays off until this and the model are both set.",
+      "https://api.openai.com/v1/chat/completions",
+      this.plugin.settings.conceptNamingEndpoint,
+      (v) => (this.plugin.settings.conceptNamingEndpoint = v),
+    );
+
+    this.textField(
+      host,
+      "Naming model",
+      "The model id to ask for the tag renames. Sent with each request, alongside the note excerpts above.",
+      "gpt-4o-mini",
+      this.plugin.settings.conceptNamingModel,
+      (v) => (this.plugin.settings.conceptNamingModel = v),
+    );
+
+    this.textField(
+      host,
+      "Naming API key",
+      "Optional bearer token, sent only to the endpoint above. Leave empty for a local server that needs no key.",
+      "",
+      this.plugin.settings.conceptNamingApiKey,
+      (v) => (this.plugin.settings.conceptNamingApiKey = v),
+      true,
     );
   }
 
@@ -2407,6 +2933,108 @@ class ReaderOfflineModal extends Modal {
   onClose(): void {
     if (this.timer !== null) window.clearInterval(this.timer);
     this.timer = null;
+    this.contentEl.empty();
+  }
+}
+
+// One row of the review modal: every proposal sharing one (replacesTag, tagPath)
+// pair. The tick selects EVERY note instance — the flat selection handed to the
+// apply path is the group expanded, never a rewritten proposal.
+interface ProposalReviewRow {
+  replacesTag?: string; // undefined = additive row: an append, never a rewrite
+  tagPath: string;
+  instances: TagRewriteProposal[];
+  countEls: HTMLElement[]; // per-instance slots the async inline-count preview fills
+  selected: boolean; // UNCHECKED default: bulk mutation is never implicit
+}
+
+// The review modal: the approval surface for concept-tag REPLACEMENTS (the
+// insights report is only a preview). The two manual apply commands open it
+// instead of applying; every proposal starts UNCHECKED, and dismissal — Cancel,
+// Esc, backdrop — applies NOTHING. Identical (replacesTag, tagPath) pairs
+// across notes share one checkbox whose body lists every affected note, so a
+// vault-wide rename is reviewed once and ticked as one. Replacement lines
+// preview WHERE the rewrite strikes — a per-note inline-occurrence count from
+// the pure computeInlineRewrite over the same inline access Apply uses, reads
+// only; nothing mutates before Apply selected runs.
+class ConceptTagReviewModal extends Modal {
+  private groups: ProposalReviewRow[];
+
+  constructor(
+    private plugin: RelatedNotesPlugin,
+    proposals: TagRewriteProposal[],
+    // Review-only view of the F4 adapter (planning, never mutation, before Apply).
+    private inline: InlineRewriteAccess,
+  ) {
+    super(plugin.app);
+    const byPair = new Map<string, ProposalReviewRow>();
+    for (const p of proposals) {
+      // Additive rows group by tagPath alone — they never merge with a replacement.
+      const key = `${p.replacesTag === undefined ? "\u0000" : p.replacesTag}\u0000${p.tagPath}`;
+      let g = byPair.get(key);
+      if (!g) {
+        g = { replacesTag: p.replacesTag, tagPath: p.tagPath, instances: [], countEls: [], selected: false };
+        byPair.set(key, g);
+      }
+      g.instances.push(p);
+    }
+    this.groups = [...byPair.values()];
+  }
+
+  // Preview only: content + live cache spans through the pure computeInlineRewrite.
+  // Drift (a null plan) or no matching occurrence previews nothing; this never writes.
+  private async fillInlineCounts(): Promise<void> {
+    for (const g of this.groups) {
+      if (g.replacesTag === undefined) continue; // additive lines never strike inline
+      for (let i = 0; i < g.instances.length; i++) {
+        const inst = g.instances[i];
+        const content = await this.inline.readNoteContent(inst.notePath);
+        if (content === null) continue; // gone or unreadable: no preview; apply skips it anyway
+        const spans = await this.inline.inlineTagSpans(inst.notePath);
+        const plan = computeInlineRewrite(content, spans, g.replacesTag, g.tagPath);
+        const n = plan === null ? 0 : plan.edits.length;
+        if (n > 0) g.countEls[i]?.setText(` — ${n} inline occurrences`); // notice tone: raw numbers, no plural math
+      }
+    }
+  }
+
+  onOpen(): void {
+    this.titleEl.setText("Review concept-tag proposals");
+    const c = this.contentEl;
+    const wl = (p: string): string => `[[${p.replace(/\.md$/i, "")}]]`; // the report's note-label form
+    c.createEl("p", {
+      cls: "setting-item-description",
+      text:
+        "Nothing is applied until you tick proposals and press Apply selected. Replacements also rename matching inline #tags in the note body; the per-note count previews where. Cancel, Esc or a click outside applies nothing.",
+    });
+    for (const g of this.groups) {
+      const row = c.createDiv();
+      const label = row.createEl("label");
+      const box = label.createEl("input", { type: "checkbox" }); // unchecked default
+      box.onchange = () => {
+        g.selected = box.checked;
+      };
+      label.appendText(g.replacesTag === undefined ? `#${g.tagPath}` : `#${g.replacesTag} → #${g.tagPath}`);
+      const body = row.createDiv(); // a group's body: every affected note with its counts
+      g.countEls = [];
+      for (const inst of g.instances) {
+        const line = body.createDiv();
+        line.appendText(wl(inst.notePath));
+        g.countEls.push(line.createSpan());
+        line.appendText(` · ${inst.kind} · ${Math.round(inst.confidence * 100)}% · ${inst.evidence}`);
+      }
+    }
+    const btns = c.createDiv();
+    btns.createEl("button", { text: "Apply selected", cls: "mod-cta" }).onclick = () => {
+      const selected = this.groups.filter((g) => g.selected).flatMap((g) => g.instances);
+      this.close(); // the apply's Notice is the feedback; the modal has said all it has
+      void this.plugin.applyReviewedProposals(selected);
+    };
+    btns.createEl("button", { text: "Cancel" }).onclick = () => this.close(); // dismissal applies nothing, by construction
+    void this.fillInlineCounts();
+  }
+
+  onClose(): void {
     this.contentEl.empty();
   }
 }

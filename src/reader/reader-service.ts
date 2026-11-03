@@ -7,6 +7,14 @@ import { assetsReady, autoRung, ensureAssets, RUNGS, RungSpec } from "./reader-a
 import { ReaderEngine } from "./reader-engine";
 import { detectLanguage, gistTask, NoteContextInput, oneLinerTask, pickTagsTask, TaskResult } from "./reader-tasks";
 
+// One store-gated existing-tag vote: `support` = ranked neighbours carrying
+// the tag inside the df window, `voters` = ranked tagged neighbours in it.
+export interface TagNeighbour {
+  tag: string; // an existing vault tag, lowercased (store convention)
+  support: number;
+  voters: number;
+}
+
 export interface ReaderHost {
   // Environment
   vaultRead(file: TFile): Promise<string>;
@@ -14,6 +22,8 @@ export interface ReaderHost {
   fileByPath(path: string): TFile | null;
   fileTags(path: string): string[]; // lowercased frontmatter+inline tags
   neighborPaths(path: string, k: number): Promise<string[]>;
+  taxonomyCandidates(path: string): string[]; // PascalCase tag paths for the note; [] when no taxonomy exists
+  tagNeighbours(path: string): TagNeighbour[]; // store votes, already df-windowed (the store owns that filter); sync by contract
   recentPaths(): string[];
   // Coordination
   indexBusy(): boolean; // building / embedding / persisting
@@ -34,12 +44,38 @@ interface Artifact {
   model: string;
   tags?: string[]; // verified suggestions (may be empty = none fit)
   tagsH?: string; // hash of (h + candidate set) the tags were computed for
+  cand?: string[]; // the exact offered list the tags were computed for (serves only while it covers the taxonomy)
   dismissed?: string[];
 }
 
 export type ReaderPace = "light" | "balanced" | "fast";
 const TICK_MS: Record<ReaderPace, number> = { light: 45_000, balanced: 12_000, fast: 6_000 };
 const IDLE_MS = 20_000;
+
+// Cap of the composed offered list; distinct from pickTagsTask's pick cap of 3.
+export const MAX_TAG_CANDIDATES = 12;
+
+// The single composer of the offered tag list: taxonomy paths first (given
+// order, ungated by design — a new path has df 0), then store votes by support
+// desc, tag asc. The df window lives in the store's tagNeighbours, not here.
+// Pure: no host, no clock, no fs. Deterministic: same inputs → same array.
+export function composeTagCandidates(own: string[], votes: TagNeighbour[], taxonomyPaths: string[]): string[] {
+  const ownCi = new Set(own.map((t) => t.toLowerCase())); // never offer a tag the note already carries
+  const out: string[] = [];
+  const seen = new Set<string>();
+  const add = (t: string): void => {
+    const k = t.toLowerCase();
+    if (ownCi.has(k) || seen.has(k)) return; // ci dedup, first occurrence keeps its verbatim string
+    seen.add(k);
+    out.push(t);
+  };
+  for (const p of taxonomyPaths) add(p);
+  const ranked = votes
+    .filter((v) => v.support >= 2) // pick-quality threshold, moved here from the reader's deleted inline vote
+    .sort((a, b) => b.support - a.support || (a.tag < b.tag ? -1 : a.tag > b.tag ? 1 : 0));
+  for (const v of ranked) add(v.tag);
+  return out.slice(0, MAX_TAG_CANDIDATES);
+}
 
 export interface ReaderStatus {
   state: "off" | "downloading" | "ready" | "error";
@@ -57,8 +93,6 @@ export class ReaderService {
   private timer: number | null = null;
   private busy = false;
   private saveQueued = false;
-  private tagDf: Map<string, number> | null = null;
-  private tagDfAt = 0;
   status: ReaderStatus = { state: "off", detail: "", read: 0, total: 0, pct: null };
   onStatus: (() => void) | null = null;
 
@@ -268,31 +302,31 @@ export class ReaderService {
     this.queueSave();
   }
 
-  // Verified tag suggestions for the ACTIVE note. Nomination is structural
-  // (discriminative tags carried by ranked neighbors); the reader only picks
-  // from that closed set. Returns cached results synchronously; computes in
-  // the background and re-renders when fresh ones land.
+  // Verified tag suggestions for the ACTIVE note. Candidates arrive through
+  // one composer — store votes (df-windowed there) plus ungated taxonomy tag
+  // paths; the reader only picks from that closed set. A cached set serves
+  // only while its artifact is fresh AND its recorded offered list still
+  // covers every current taxonomy candidate (candidate coverage: a new path
+  // can never be suppressed by a stale cache); otherwise recompute in the
+  // background, re-rendering when fresh tags land.
   suggestedTags(path: string): string[] {
     const f = this.host.fileByPath(path);
     const a = this.artifacts.get(path);
     if (!f || !this.engine || this.status.state !== "ready") return [];
-    const cached = a && a.tagsH?.startsWith(this.srcHash(f)) ? a.tags ?? [] : [];
-    if (a && a.tagsH?.startsWith(this.srcHash(f))) {
-      return cached.filter((t) => !(a.dismissed ?? []).includes(t));
+    if (a && a.h === this.srcHash(f) && this.candidatesCovered(path, a)) {
+      return (a.tags ?? []).filter((t) => !(a.dismissed ?? []).includes(t));
     }
     void this.computeTags(f);
     return [];
   }
 
-  private tagDocFreq(): Map<string, number> {
-    if (this.tagDf && Date.now() - this.tagDfAt < 300_000) return this.tagDf;
-    const df = new Map<string, number>();
-    for (const f of this.host.markdownFiles()) {
-      for (const t of new Set(this.host.fileTags(f.path))) df.set(t, (df.get(t) ?? 0) + 1);
-    }
-    this.tagDf = df;
-    this.tagDfAt = Date.now();
-    return df;
+  // Candidate coverage: the cached offered list must contain every current
+  // taxonomy candidate (ci). An artifact with no recorded list was written
+  // before the composer existed — uncovered, so it recomputes.
+  private candidatesCovered(path: string, a: Artifact): boolean {
+    if (!a.cand) return false;
+    const offered = new Set(a.cand.map((c) => c.toLowerCase()));
+    return this.host.taxonomyCandidates(path).every((p) => offered.has(p.toLowerCase()));
   }
 
   private tagsInFlight = new Set<string>();
@@ -306,21 +340,13 @@ export class ReaderService {
     if (!this.engine.loaded && Date.now() - this.host.lastUserActivity() < IDLE_MS) return;
     this.tagsInFlight.add(file.path);
     try {
-      const df = this.tagDocFreq();
-      const total = this.host.markdownFiles().length;
-      const own = new Set(this.host.fileTags(file.path));
-      const counts = new Map<string, number>();
-      for (const p of await this.host.neighborPaths(file.path, 12)) {
-        for (const t of new Set(this.host.fileTags(p))) {
-          const d = df.get(t) ?? 0;
-          if (d >= 3 && d <= total * 0.5 && !own.has(t)) counts.set(t, (counts.get(t) ?? 0) + 1);
-        }
-      }
-      const candidates = [...counts.entries()]
-        .filter(([, c]) => c >= 2)
-        .sort((x, y) => y[1] - x[1])
-        .slice(0, 8)
-        .map(([t]) => t);
+      // Candidates solely from the composer: own tags excluded, store votes
+      // (already df-windowed) and taxonomy paths (ungated) offered.
+      const candidates = composeTagCandidates(
+        this.host.fileTags(file.path),
+        this.host.tagNeighbours(file.path),
+        this.host.taxonomyCandidates(file.path),
+      );
       const h = this.srcHash(file);
       const key = `${h}|${candidates.join(",")}`;
       let tags: string[] = [];
@@ -331,7 +357,7 @@ export class ReaderService {
       }
       const prev = this.artifacts.get(file.path);
       const carry = prev?.h === h ? prev : { dismissed: prev?.dismissed };
-      this.artifacts.set(file.path, { model: this.rung().id, ...carry, h, tags, tagsH: key });
+      this.artifacts.set(file.path, { model: this.rung().id, ...carry, h, tags, tagsH: key, cand: candidates });
       this.queueSave();
       this.host.requestRender();
     } catch (e) {

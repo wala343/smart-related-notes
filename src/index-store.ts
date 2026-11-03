@@ -23,6 +23,19 @@ import {
   type StoredIndexHeader,
   type SerializableEntry,
 } from "./vector-math";
+import {
+  joinSegments,
+  type TagRewriteProposal,
+  type TaxonomyNode,
+  type TaxonomyResult,
+} from "./tagging/proposal";
+import { renderTaxonomyPreview } from "./tagging/taxonomy-report";
+import {
+  cleanTag,
+  detectPlacement,
+  detectNormalization,
+  type TagInventory,
+} from "./tagging/detectors";
 
 // =============================================================================
 // SCHEMA / version constant. Bumped 1 -> 2 for the multi-vector layout (mean vector
@@ -315,13 +328,21 @@ export interface VaultInsights {
   total: number;
   orphans: { path: string; closest?: string; closestScore?: number }[]; // no links in/out
   stale: { path: string; mtime: number }[]; // oldest edited
-  nearDuplicates: { a: string; b: string; score: number }[]; // very similar pairs
-  suggestedLinks: { from: string; to: string; score: number }[]; // related, not yet linked
+  nearDuplicates: { a: string; b: string; score: number }[]; // very similar pairs, scored plain
+  // related, not yet linked. One row per unordered pair across BOTH pair tables
+  // (a near-dupe never reappears as a suggestion); a same-folder row ranks at
+  // score * 0.75, keeps the raw similarity in score, and receipts the demotion
+  // in caveats.
+  suggestedLinks: { from: string; to: string; score: number; caveats?: string[] }[];
   // A note is missing a DISCRIMINATIVE tag that most of its semantic neighbours carry.
   suggestedTags: { path: string; tag: string; support: number; neighbors: number }[];
-  // Pairs the LINK GRAPH predicts belong together while the prose does not —
-  // each is outside the other's content top-10, so similarity ranking can never
-  // surface them. `via` is the shared note that bridges them (the receipt).
+  // The concept-tag pipeline's proposals in sweep order: taxonomy rows, then
+  // placement, then normalization (order 0016 appends propagation). Without a
+  // taxonomy argument the taxonomy/detector parts are all empty.
+  conceptProposals: TagRewriteProposal[];
+  // renderTaxonomyPreview(taxonomy) carried verbatim — this store rewrites no
+  // line; [] without a taxonomy.
+  taxonomyPreview: string[];
 }
 
 // Index lifecycle state, surfaced to the view for its status line.
@@ -2772,6 +2793,48 @@ export class IndexStore {
     return set;
   }
 
+  // The same census as noteTags WITHOUT the comparison form: each tag exactly as
+  // written on the note, ONE leading "#" stripped, case and separators untouched —
+  // order 0005's "exact string". Only the canonical tag inventory reads this;
+  // everywhere else in the store compares through normalizeTag.
+  private noteTagsExact(path: string): Set<string> {
+    const set = new Set<string>();
+    const cache = this.app.metadataCache.getCache(path);
+    if (!cache) return set;
+    for (const t of cache.tags ?? []) set.add(t.tag.startsWith("#") ? t.tag.slice(1) : t.tag);
+    if (cache.frontmatter?.tags) addFrontmatterTagsExact(set, cache.frontmatter.tags);
+    return set;
+  }
+
+  // The canonical tag inventory over the ELIGIBLE universe — indexed, not ignored,
+  // not under Templates/, in the shared pool: the universe the taxonomy is
+  // computed over. Keyed by cleanTag(exact).toLowerCase(). Build ONCE per sweep
+  // and hand the same map to both detectors; the detectors never derive it.
+  tagInventory(ignore: Set<string> = new Set()): TagInventory {
+    const inventory: TagInventory = new Map();
+    for (const entry of this.entries.values()) {
+      const path = entry.path;
+      if (ignore.has(path) || path.startsWith("Templates/")) continue;
+      if (this.noteAreas(path).size > 0) continue; // shared pool only
+      for (const exact of this.noteTagsExact(path)) {
+        const canonical = cleanTag(exact).toLowerCase();
+        let tag = inventory.get(canonical);
+        if (!tag) {
+          tag = { canonical, notePaths: [], exactByNote: new Map() };
+          inventory.set(canonical, tag);
+        }
+        const exacts = tag.exactByNote.get(path);
+        if (exacts) exacts.push(exact);
+        else {
+          tag.exactByNote.set(path, [exact]);
+          tag.notePaths.push(path); // first exact of this (tag, note): one path entry
+        }
+      }
+    }
+    for (const tag of inventory.values()) tag.notePaths.sort(); // sorted by note path
+    return inventory;
+  }
+
   // The ACTIVATED isolated areas a note belongs to: the top-level namespace of each of
   // its tags (the part before the first "/", so goa/character -> "goa"), kept only if
   // that namespace is in options.isolatedAreas. Empty = the note is in the shared pool.
@@ -2795,18 +2858,83 @@ export class IndexStore {
     return false;
   }
 
+  // Tag document frequencies over ALL indexed entries. The ignore set is a
+  // report-generation notion and does not apply to single-file queries, so this
+  // census is unfiltered; computeInsights keeps building its own ignore-filtered maps.
+  private tagCensus(): { tagsByPath: Map<string, Set<string>>; tagDF: Map<string, number> } {
+    const tagDF = new Map<string, number>();
+    const tagsByPath = new Map<string, Set<string>>();
+    for (const entry of this.entries.values()) {
+      const ts = this.noteTags(entry.path);
+      tagsByPath.set(entry.path, ts);
+      for (const t of ts) tagDF.set(t, (tagDF.get(t) ?? 0) + 1);
+    }
+    return { tagsByPath, tagDF };
+  }
+
+  // The neighbour tag vote — the whole rule lives here so the report rows and
+  // suggestedTagNeighbours can never drift: a tag is voted in when the note itself
+  // does not carry it, a majority of its ranked neighbours do (voters >=
+  // MIN_TAG_NEIGHBORS), and the tag's document frequency inside the supplied census
+  // is discriminative. Rows come back in the report's vote ordering: support ratio
+  // descending, then support descending. Tag data must be in normalizeTag form.
+  private tagVotes(
+    ranked: RankedNote[],
+    own: ReadonlySet<string>,
+    tagsByPath: ReadonlyMap<string, Set<string>>,
+    tagDF: ReadonlyMap<string, number>,
+  ): { tag: string; support: number; voters: number }[] {
+    const votes = new Map<string, number>();
+    let voters = 0;
+    for (const r of ranked) {
+      const rt = tagsByPath.get(r.file.path);
+      if (!rt) continue;
+      voters++;
+      for (const t of rt) votes.set(t, (votes.get(t) ?? 0) + 1);
+    }
+    if (voters < MIN_TAG_NEIGHBORS) return [];
+    const need = Math.ceil(TAG_VOTE * voters);
+    const maxDF = tagsByPath.size * 0.5; // skip tags on >50% of notes (not discriminative)
+    const rows: { tag: string; support: number; voters: number }[] = [];
+    for (const [t, c] of votes) {
+      if (c < need || own.has(t)) continue;
+      const df = tagDF.get(t) ?? 0;
+      if (df < MIN_TAG_DF || df > maxDF) continue;
+      rows.push({ tag: t, support: c, voters });
+    }
+    return rows.sort(
+      (a, b) => b.support / b.voters - a.support / a.voters || b.support - a.support,
+    );
+  }
+
+  // The per-note neighbour tag vote as a query (tags in normalizeTag comparison
+  // form): the same rule the report's suggestedTags rows run, over the note's own
+  // rank() list and a df census of ALL indexed entries. Not in the index -> no
+  // neighbours to consult -> [].
+  suggestedTagNeighbours(file: TFile): { tag: string; support: number; voters: number }[] {
+    if (!this.entries.has(file.path)) return [];
+    const { tagsByPath, tagDF } = this.tagCensus();
+    return this.tagVotes(this.rank(file), this.noteTags(file.path), tagsByPath, tagDF);
+  }
+
   // Vault-level link-building + hygiene pass. For every indexed note it runs the same
   // semantic rank() used by the panel, then aggregates: orphans (no resolved links in
   // or out, each paired with its closest relative as a starting point), the strongest
   // related-but-UNLINKED pairs (link suggestions), near-duplicate pairs (very high
   // similarity), and the oldest-edited notes. Thresholds tuned to the score
-  // distribution: suggestions >= SUGGEST_SIM, near-dupes >= DUP_SIM.
-  computeInsights(ignore: Set<string> = new Set()): VaultInsights {
+  // distribution: suggestions >= SUGGEST_SIM, near-dupes >= DUP_SIM. The pair
+  // tables hold ONE row per unordered pair (a near-dupe is never re-listed as a
+  // suggestion) and exclude every note the template de-crowding grouped; same-
+  // folder suggestion rows rank at score * SAME_FOLDER_FACTOR so cross-domain
+  // pairs win the top slice. Pass a taxonomy and the concept-tag pipeline rides
+  // along as conceptProposals + taxonomyPreview.
+  computeInsights(ignore: Set<string> = new Set(), taxonomy?: TaxonomyResult): VaultInsights {
     const SUGGEST_SIM = 0.5,
       DUP_SIM = 0.68,
       STALE_N = 12,
       SUGGEST_N = 50,
-      DUP_N = 20;
+      DUP_N = 20,
+      SAME_FOLDER_FACTOR = 0.75; // pinned: same-folder rows rank at score * this
     const mc = this.app.metadataCache;
     // Every note that participates in at least one resolved link (either direction).
     // The generated report itself is ignored as a link source — otherwise a re-run
@@ -2831,20 +2959,29 @@ export class IndexStore {
       tagsByPath.set(entry.path, ts);
       for (const t of ts) tagDF.set(t, (tagDF.get(t) ?? 0) + 1);
     }
-    const totalNotes = tagsByPath.size;
-    const MAX_TAG_DF = totalNotes * 0.5; // skip tags on >50% of notes (not discriminative)
-    const MIN_TAG_DF = 3; // need a real cluster before propagating
-    const TAG_VOTE = 0.5; // a majority of neighbours must carry the tag
-    const MIN_TAG_NEIGHBORS = 5; // ignore sparse notes (too few tagged neighbours to trust)
     const TAG_N = 50;
 
     const orphans: VaultInsights["orphans"] = [];
     const stale: VaultInsights["stale"] = [];
-    const suggested: VaultInsights["suggestedLinks"] = [];
     const dups: VaultInsights["nearDuplicates"] = [];
     const suggestedTags: VaultInsights["suggestedTags"] = [];
-    const seenSug = new Set<string>();
-    const seenDup = new Set<string>();
+    // Template-shaped notes are neither half of any pair row; the census runs ONCE
+    // per sweep, over the same MIN_TEMPLATE_GROUP..size-ceiling window as the
+    // de-crowding itself (templateGroups already applies the ceiling).
+    const templateShaped = new Set<string>();
+    for (const group of this.templateGroups()) {
+      if (group.length < MIN_TEMPLATE_GROUP) continue;
+      for (const path of group) templateShaped.add(path);
+    }
+    // One row per UNORDERED pair, shared by both pair tables. The key joins the
+    // two paths with a "\n" — impossible inside a vault path, so plain
+    // concatenation can never collide. This line carries the file's two stray
+    // NUL bytes (the old key literals held them; nothing may delete them):   
+    const pairKey = (a: string, b: string): string => (a < b ? `${a}\n${b}` : `${b}\n${a}`);
+    const dupKeys = new Set<string>();
+    // Suggestions keyed by pair: a later >= DUP_SIM direction evicts the row (the
+    // near-dupe claim is the stronger one); the Map keeps first-direction order.
+    const sugByKey = new Map<string, VaultInsights["suggestedLinks"][number]>();
     for (const entry of this.entries.values()) {
       if (ignore.has(entry.path)) continue;
       stale.push({ path: entry.path, mtime: entry.mtime });
@@ -2860,59 +2997,116 @@ export class IndexStore {
           closestScore: top?.score,
         });
       }
+      const pairExcluded = templateShaped.has(entry.path);
       for (const r of ranked) {
-        const key =
-          entry.path < r.file.path
-            ? `${entry.path} ${r.file.path}`
-            : `${r.file.path} ${entry.path}`;
+        if (pairExcluded || templateShaped.has(r.file.path)) continue;
+        const key = pairKey(entry.path, r.file.path);
         if (r.score >= DUP_SIM) {
-          if (!seenDup.has(key)) {
-            seenDup.add(key);
-            dups.push({ a: entry.path, b: r.file.path, score: r.score });
-          }
+          if (dupKeys.has(key)) continue;
+          dupKeys.add(key);
+          sugByKey.delete(key); // one row per pair: the near-dupe claim outranks the suggestion
+          dups.push({ a: entry.path, b: r.file.path, score: r.score });
         } else if (r.connection !== "linked" && r.score >= SUGGEST_SIM) {
-          if (!seenSug.has(key)) {
-            seenSug.add(key);
-            suggested.push({ from: entry.path, to: r.file.path, score: r.score });
-          }
+          if (dupKeys.has(key) || sugByKey.has(key)) continue;
+          const row: VaultInsights["suggestedLinks"][number] = {
+            from: entry.path,
+            to: r.file.path,
+            score: r.score,
+          };
+          if (sameFolderPair(entry.path, r.file.path)) row.caveats = ["same-folder"];
+          sugByKey.set(key, row);
         }
       }
-      // Tag propagation: tags carried by a majority of this note's neighbours but not
-      // by the note itself, restricted to discriminative tags. The plugin infers a
-      // missing category (e.g. goa/character) from similarity, with no hand-written rule.
+      // Tag propagation: the neighbour tag vote; the rule itself lives in tagVotes.
       const own = tagsByPath.get(entry.path) ?? new Set<string>();
-      const votes = new Map<string, number>();
-      let nb = 0;
-      for (const r of ranked) {
-        const rt = tagsByPath.get(r.file.path);
-        if (!rt) continue;
-        nb++;
-        for (const t of rt) votes.set(t, (votes.get(t) ?? 0) + 1);
-      }
-      if (nb >= MIN_TAG_NEIGHBORS) {
-        const need = Math.ceil(TAG_VOTE * nb);
-        for (const [t, c] of votes) {
-          if (c < need || own.has(t)) continue;
-          const df = tagDF.get(t) ?? 0;
-          if (df < MIN_TAG_DF || df > MAX_TAG_DF) continue;
-          suggestedTags.push({ path: entry.path, tag: t, support: c, neighbors: nb });
-        }
+      for (const v of this.tagVotes(ranked, own, tagsByPath, tagDF)) {
+        suggestedTags.push({ path: entry.path, tag: v.tag, support: v.support, neighbors: v.voters });
       }
     }
     stale.sort((a, b) => a.mtime - b.mtime);
-    suggested.sort((a, b) => b.score - a.score);
-    dups.sort((a, b) => b.score - a.score);
+    dups.sort((a, b) => b.score - a.score); // near-dupes keep the plain-score ordering
     orphans.sort((a, b) => (b.closestScore ?? 0) - (a.closestScore ?? 0));
     suggestedTags.sort(
       (a, b) => b.support / b.neighbors - a.support / a.neighbors || b.support - a.support,
     );
+    // Suggested links ranked AFTER the same-folder demotion, sliced after that:
+    // a demoted row sinks only against rows its raw score used to beat. Ties go
+    // raw score descending, then from ascending, so the order is caller-independent.
+    const rankKey = (row: VaultInsights["suggestedLinks"][number]): number =>
+      row.caveats ? row.score * SAME_FOLDER_FACTOR : row.score;
+    const suggested = [...sugByKey.values()];
+    suggested.sort(
+      (a, b) =>
+        rankKey(b) - rankKey(a) ||
+        b.score - a.score ||
+        (a.from < b.from ? -1 : a.from > b.from ? 1 : 0),
+    );
+    // The concept-tag pipeline, in pinned order: taxonomy rows (eligible universe
+    // only, sorted by note path), then the two consumed detectors VERBATIM over
+    // one shared inventory census; order 0016 appends propagation later. No
+    // taxonomy: nothing to detect against, so the detector parts stay empty.
+    const conceptProposals: TagRewriteProposal[] = [];
+    if (taxonomy) {
+      const nodeByPath = new Map<string, TaxonomyNode>();
+      for (const node of taxonomy.nodes) nodeByPath.set(joinSegments(node.segments), node);
+      const leafRows = [...taxonomy.leafAssignment].sort((x, y) =>
+        x[0] < y[0] ? -1 : x[0] > y[0] ? 1 : 0,
+      );
+      for (const [notePath, tagPath] of leafRows) {
+        if (ignore.has(notePath) || notePath.startsWith("Templates/")) continue;
+        if (this.noteAreas(notePath).size > 0) continue; // shared pool only
+        const node = nodeByPath.get(tagPath);
+        if (!node) continue; // a leaf path naming no node cannot carry an assignment
+        conceptProposals.push({
+          kind: "taxonomy",
+          notePath,
+          tagPath,
+          confidence: 1,
+          evidence: `assigned to node ${tagPath} (${node.notePaths.length} notes, level ${node.level})`,
+        });
+      }
+      const inventory = this.tagInventory(ignore); // built ONCE; both detectors read it
+      conceptProposals.push(
+        ...detectPlacement(taxonomy, inventory),
+        ...detectNormalization(taxonomy, inventory),
+      );
+    }
+    // Propagation: one proposal per RETURNED suggestedTags row, same order — the
+    // slice is taken once here so the report and the proposals cannot diverge.
+    const tagRows = suggestedTags.slice(0, TAG_N);
+    // The canonical case map: normalized tag -> how the vault spells it, FIRST
+    // casing seen wins, entries insertion order. A suggested tag already EXISTS in
+    // the vault, so a propagation tagPath is this spelling rather than one of
+    // order 0001's PascalCase taxonomy paths.
+    const canonicalCase = new Map<string, string>();
+    for (const entry of this.entries.values()) {
+      for (const exact of this.noteTagsExact(entry.path)) {
+        const key = normalizeTag(exact);
+        if (!canonicalCase.has(key)) canonicalCase.set(key, exact);
+      }
+    }
+    for (const row of tagRows) {
+      // The vote's tags come out of this same census, so a miss is unreachable;
+      // skip it rather than emit a proposal with no tag.
+      const tagPath = canonicalCase.get(row.tag);
+      if (tagPath === undefined) continue;
+      conceptProposals.push({
+        kind: "propagation",
+        notePath: row.path,
+        tagPath,
+        confidence: row.support / row.neighbors,
+        evidence: `${row.support} of ${row.neighbors} nearest neighbours carry this tag`,
+      });
+    }
     return {
       total: this.entries.size,
       orphans,
       stale: stale.slice(0, STALE_N),
       nearDuplicates: dups.slice(0, DUP_N),
       suggestedLinks: suggested.slice(0, SUGGEST_N),
-      suggestedTags: suggestedTags.slice(0, TAG_N),
+      suggestedTags: tagRows,
+      conceptProposals,
+      taxonomyPreview: taxonomy ? renderTaxonomyPreview(taxonomy) : [],
     };
   }
 
@@ -3391,6 +3585,11 @@ export class IndexStore {
 // helpers (module-scope, no `this`)
 // =============================================================================
 
+// --- neighbour tag vote knobs (see IndexStore.tagVotes) ----------------------
+const TAG_VOTE = 0.5; // a majority of neighbours must carry the tag
+const MIN_TAG_DF = 3; // need a real cluster before propagating
+const MIN_TAG_NEIGHBORS = 5; // ignore sparse notes (too few tagged neighbours to trust)
+
 // Normalize a tag for comparison: lower-cased, leading '#' stripped. Nested tags
 // (#a/b) are kept whole — a/b and a are distinct, the conservative choice.
 function normalizeTag(tag: string): string {
@@ -3423,6 +3622,28 @@ function addFrontmatterTags(into: Set<string>, raw: unknown): void {
       }
     }
   }
+}
+
+// addFrontmatterTags's case-preserving twin for the exact tag reader: splits the
+// same way, strips ONE leading "#", keeps everything else exactly as written.
+function addFrontmatterTagsExact(into: Set<string>, raw: unknown): void {
+  const add = (t: string): void => {
+    const e = t.startsWith("#") ? t.slice(1) : t;
+    if (e.length > 0) into.add(e);
+  };
+  if (typeof raw === "string") {
+    for (const t of raw.split(/[\s,]+/)) add(t);
+  } else if (Array.isArray(raw)) {
+    for (const t of raw) if (typeof t === "string") add(t);
+  }
+}
+
+// A same-folder pair: both notes have an immediate parent folder (the path before
+// the last "/") and the two folders are equal. Two vault-root notes: never one.
+function sameFolderPair(a: string, b: string): boolean {
+  const i = a.lastIndexOf("/");
+  const j = b.lastIndexOf("/");
+  return i > 0 && j > 0 && a.slice(0, i) === b.slice(0, j);
 }
 
 // Count of shared frontmatter key/value pairs (excluding `tags`), normalized into

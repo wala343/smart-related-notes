@@ -69,17 +69,19 @@ export function gistTask(n: NoteContextInput): TaskResult {
 }
 
 // Closed-set tag pick: 0-3 tags, ONLY from the offered candidates; anything
-// else is dropped by the validator, so hallucinated tags cannot exist.
+// else is dropped by the validator, so hallucinated tags cannot exist. Matching
+// is case-insensitive (the reader may reply lowercase) but the picked strings
+// are the offered ones verbatim, so PascalCase tag paths survive end-to-end.
 export function pickTagsTask(n: NoteContextInput, candidates: string[]): TaskResult {
   return {
     prompt: `Read this note:\n"""${budgetedContext(n, 2600)}"""\n\nWhich of these tags fit the note? Pick 0 to 3, ONLY from this list, best first:\n${candidates.map((t) => `#${t}`).join(" ")}\nReply with just the chosen tags (or NONE), no other text.`,
     maxTokens: 32,
     validate(raw) {
-      const offered = new Set(candidates);
+      const offered = new Map(candidates.map((c) => [c.toLowerCase(), c])); // ci key → offered string, verbatim
       const picked: string[] = [];
       for (const m of raw.matchAll(/#?([\p{L}\p{N}/_-]+)/gu)) {
-        const t = m[1].toLowerCase();
-        if (offered.has(t) && !picked.includes(t)) picked.push(t);
+        const hit = offered.get(m[1].toLowerCase());
+        if (hit && !picked.includes(hit)) picked.push(hit);
         if (picked.length === 3) break;
       }
       return picked;
