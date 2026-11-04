@@ -93,13 +93,18 @@ export class ReaderService {
   private timer: number | null = null;
   private busy = false;
   private saveQueued = false;
+  private host: ReaderHost;
+  private opts: { rung: "auto" | RungSpec["id"]; pace: ReaderPace; idleUnloadMinutes: number };
   status: ReaderStatus = { state: "off", detail: "", read: 0, total: 0, pct: null };
   onStatus: (() => void) | null = null;
 
   constructor(
-    private host: ReaderHost,
-    private opts: { rung: "auto" | RungSpec["id"]; pace: ReaderPace; idleUnloadMinutes: number },
-  ) {}
+    host: ReaderHost,
+    opts: { rung: "auto" | RungSpec["id"]; pace: ReaderPace; idleUnloadMinutes: number },
+  ) {
+    this.host = host;
+    this.opts = opts;
+  }
 
   rung(): RungSpec {
     return this.opts.rung === "auto" ? autoRung() : RUNGS.find((r) => r.id === this.opts.rung) ?? autoRung();

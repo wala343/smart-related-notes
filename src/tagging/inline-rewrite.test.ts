@@ -2,7 +2,7 @@
 // because fence/link/url exclusion lives in the caller's cache, not in this module.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-// Node's transform-types needs the ".ts" specifier; tsconfig (not ours to edit) omits
+// Node's type stripping needs the ".ts" specifier; tsconfig (not ours to edit) omits
 // allowImportingTsExtensions. The expect-error pins the one tsc complaint, nothing else.
 // @ts-expect-error
 import { computeInlineRewrite, computeInlineRewriteBatch, revertInlineRewrites, type InlineEditRecord, type InlineReplacementRequest, type InlineTagSpan } from "./inline-rewrite.ts";

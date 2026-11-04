@@ -7,7 +7,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { register } from "node:module";
-// The ".ts" specifiers are for node's transform-types. tsc (moduleResolution Bundler,
+// The ".ts" specifiers are for node's type stripping. tsc (moduleResolution Bundler,
 // no allowImportingTsExtensions) only charges ".ts" specifiers on value imports, so the
 // two type-only imports below need no directive and the dynamic import gets one.
 // Both are erased at runtime before any resolution happens.

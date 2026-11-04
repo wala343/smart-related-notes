@@ -5,7 +5,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import type { TaxonomyNode, TaxonomyResult } from "./proposal";
 import type { NamingTransport } from "./naming-bridge";
-// Node's transform-types needs the ".ts" specifier; tsc flags it only because tsconfig (not ours to edit)
+// Node's type stripping needs the ".ts" specifier; tsc flags it only because tsconfig (not ours to edit)
 // omits allowImportingTsExtensions. The expect-error pins the one tsc complaint, nothing else. One line:
 // the complaint lands on the specifier, and the directive only pins the line right below it.
 // @ts-expect-error

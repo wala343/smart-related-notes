@@ -14,10 +14,10 @@
     "bench": "node --experimental-strip-types bench/at-rest.mjs",
     "pretest": "node gen-ort.mjs",
     "test": "node bench/glue-prelude-check.mjs && node bench/ort-runtime-check.mjs && npm run test:recovery && npm run test:integration",
-    "test:recovery": "node --experimental-transform-types --import ./bench/register-stub.mjs --test bench/embedding-recovery-check.mjs",
-    "test:tagging": "node --experimental-transform-types --import ./bench/register-stub.mjs --test bench/insights-store-check.mjs",
+    "test:recovery": "node --import ./bench/register-stub.mjs --test bench/embedding-recovery-check.mjs",
+    "test:tagging": "node --import ./bench/register-stub.mjs --test bench/insights-store-check.mjs",
     "version": "node version-bump.mjs && git add manifest.json versions.json",
-    "test:integration": "node --experimental-transform-types --import ./bench/register-stub.mjs bench/v3-integration.mjs",
+    "test:integration": "node --import ./bench/register-stub.mjs bench/v3-integration.mjs",
     "lint:strict": "eslint --config eslint.strict.mjs \"src/**/*.ts\""
   },
   "keywords": [

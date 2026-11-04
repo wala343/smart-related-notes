@@ -2,7 +2,7 @@
 // generated here with a fixed PRNG — no network, no vault or lab data.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-// Node's transform-types needs the ".ts" specifier; tsc flags it only because tsconfig (not ours to edit)
+// Node's type stripping needs the ".ts" specifier; tsc flags it only because tsconfig (not ours to edit)
 // omits allowImportingTsExtensions. The expect-error pins the one tsc complaint, nothing else.
 // @ts-expect-error
 import { joinSegments } from "./proposal.ts";

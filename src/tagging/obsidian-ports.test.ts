@@ -3,7 +3,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import type { FrontmatterReading, JsonFileAccess } from "./obsidian-ports";
-// Node's transform-types needs the ".ts" specifier; tsc flags it only because tsconfig (not ours to edit)
+// Node's type stripping needs the ".ts" specifier; tsc flags it only because tsconfig (not ours to edit)
 // omits allowImportingTsExtensions. The expect-error pins the one tsc complaint, nothing else.
 // @ts-expect-error
 import { jsonFileLedgerStorage, obsidianFrontmatterPort } from "./obsidian-ports.ts";

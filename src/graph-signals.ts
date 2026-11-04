@@ -68,8 +68,11 @@ export class GraphSignals {
   private adj = new Map<string, Set<string>>();
   private degree = new Map<string, number>();
   private built = false;
+  private app: App;
 
-  constructor(private app: App) {}
+  constructor(app: App) {
+    this.app = app;
+  }
 
   /**
    * Invalidate and RELEASE. Dropping the maps matters as much as the flag: an

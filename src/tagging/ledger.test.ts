@@ -1,7 +1,7 @@
 // Unit tests for the change ledger: offline, synthetic, deterministic (all timestamps injected).
 import { test } from "node:test";
 import assert from "node:assert/strict";
-// Node's transform-types needs the ".ts" specifier; tsconfig (not ours to edit) omits
+// Node's type stripping needs the ".ts" specifier; tsconfig (not ours to edit) omits
 // allowImportingTsExtensions. The expect-error pins the one tsc complaint, nothing else.
 // @ts-expect-error
 import { appendLedgerEntries, journalEntriesForNote, nextBatchOrdinal, pruneLedgerEntries, recordAppliedChanges, revertAppliedChanges, type InlineRevertAccess, type LedgerEntry, type LedgerStoragePort } from "./ledger.ts";
