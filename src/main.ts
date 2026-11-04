@@ -93,6 +93,7 @@ import {
   providerSelectionFrom,
 } from "./tagging/naming-bridge";
 import { renderTaxonomyPreview } from "./tagging/taxonomy-report";
+import { tagPanelData, type TagPanelData } from "./tagging/panel-data";
 import { RelatedNotesView, VIEW_TYPE_RELATED } from "./view";
 import { VaultMapView, VIEW_TYPE_MAP } from "./map-view";
 import { TitleIndex } from "./title-index";
@@ -367,6 +368,16 @@ export default class RelatedNotesPlugin extends Plugin {
   // Reader-host memo: note path -> taxonomy leaf + proposal tag paths. Emptied
   // whenever the taxonomy is invalidated or recomputed.
   private conceptTagCandidates: Map<string, string[]> | null = null;
+  // --- concept tag panel cache ---
+  // The tags panel's assembly memo: the vault-wide proposal list, the per-note
+  // carried tags read with it, and the (index epoch, naming key, confidence floor)
+  // key all three were built under. A key mismatch on the next call IS the
+  // invalidation, so this clears on the same signals as the taxonomy cache above.
+  private tagPanelMemo: {
+    proposals: TagRewriteProposal[];
+    carriedTags: Map<string, string[]>;
+    key: string;
+  } | null = null;
   private indexEpoch = 0;
   private lastIndexProgressStatus: IndexStatus = "idle";
   // Self-write suppression: the count of in-flight tagging-pipeline write
@@ -1143,7 +1154,9 @@ export default class RelatedNotesPlugin extends Plugin {
   // one-time body read for the taxonomy's c-TF-IDF corpus. The cache is keyed
   // by the index generation AND the naming settings, so a rebuild — or a change
   // to the naming mode, endpoint or model — forces exactly one recompute.
-  private async currentTaxonomy(): Promise<TaxonomyResult> {
+  // Public because the caller sits in another file: the panel's tags mode renders
+  // this taxonomy (src/view.ts), as applyReviewedProposals is public for its modal.
+  async currentTaxonomy(): Promise<TaxonomyResult> {
     if (!this.indexReady()) return { nodes: [], leafAssignment: new Map() };
     const namingKey = namingCacheKey(
       this.settings.conceptNamingMode,
@@ -1214,10 +1227,44 @@ export default class RelatedNotesPlugin extends Plugin {
     return file ? kept.filter((p) => p.notePath === file.path) : kept;
   }
 
+  // The panel's one data source: the memoized vault-wide assembly in this plugin's
+  // own comparison form, deduped and grouped per order 0024.
+  // null when conceptTaggingEnabled is false (the caller renders nothing).
+  async tagPanelDataFor(file: TFile | null): Promise<TagPanelData | null> {
+    if (!this.settings.conceptTaggingEnabled) return null;
+    if (!this.indexReady()) return { forNote: null, vault: [] }; // same loaded-state gate as the assembly itself
+    const namingKey = namingCacheKey(
+      this.settings.conceptNamingMode,
+      this.settings.conceptNamingEndpoint,
+      this.settings.conceptNamingModel,
+      this.settings.conceptNamingApiKey !== "",
+    );
+    const key = `${this.indexEpoch}|${namingKey}|${this.settings.conceptTagMinConfidence}`;
+    let memo = this.tagPanelMemo;
+    if (!memo || memo.key !== key) {
+      // ONE vault-wide assembly per key — the floor filter stays inside the assembler.
+      const proposals = await this.assembleTagProposals();
+      // One census per memo build (order 0015's rule), distilled to note -> exact tags.
+      const carriedTags = new Map<string, string[]>();
+      for (const tag of this.store.tagInventory().values()) {
+        for (const [notePath, exacts] of tag.exactByNote) {
+          const carried = carriedTags.get(notePath);
+          if (carried) carried.push(...exacts);
+          else carriedTags.set(notePath, [...exacts]);
+        }
+      }
+      memo = { proposals, carriedTags, key };
+      this.tagPanelMemo = memo;
+    }
+    return tagPanelData(file?.path ?? null, memo.proposals, (notePath) => memo.carriedTags.get(notePath) ?? []);
+  }
+
   // Reader-host member: the note's taxonomy leaf, then the tag paths of its
   // placement/normalization proposals in detector order, ci-deduped keeping
   // the first (PascalCase) rendering — leaf first. Memoized per generation.
-  private conceptTagCandidatesFor(path: string): string[] {
+  // Public because the caller sits in another file: the panel's tags mode shows
+  // these as the note's suggested tags (src/view.ts).
+  conceptTagCandidatesFor(path: string): string[] {
     if (!this.conceptTaxonomy) return []; // nothing computed yet
     return this.conceptTagCandidateMemo().get(path) ?? [];
   }
@@ -1330,7 +1377,9 @@ export default class RelatedNotesPlugin extends Plugin {
   // the approval surface for replacements (the insights report is only a
   // preview). Nothing applies here; the modal's Apply selected does. The
   // conceptTaggingEnabled gate lives in the wiring, as order 0011 pins.
-  private async reviewConceptTags(file?: TFile): Promise<void> {
+  // Public because the caller sits in another file: the panel's tags mode opens this
+  // review for a note and for the vault (src/view.ts) — the panel writes nothing.
+  async reviewConceptTags(file?: TFile): Promise<void> {
     if (!this.settings.conceptTaggingEnabled) {
       new Notice("Concept tagging is disabled in settings.");
       return;
@@ -2324,7 +2373,10 @@ export class RelatedNotesSettingTab extends PluginSettingTab {
       "Enable concept tagging",
       "The gate for the four tagging commands (apply this note, apply vault, preview taxonomy, revert changes). Off: each command just reports that tagging is disabled.",
       this.plugin.settings.conceptTaggingEnabled,
-      (v) => (this.plugin.settings.conceptTaggingEnabled = v),
+      (v) => {
+        this.plugin.settings.conceptTaggingEnabled = v;
+        this.plugin.requestPanelRender(); // live-shows/hides the panel's tags mode with the gate
+      },
       true,
     );
 
@@ -2347,7 +2399,10 @@ export class RelatedNotesSettingTab extends PluginSettingTab {
         step: 0.05,
         value: this.plugin.settings.conceptTagMinConfidence, def: 0.6,
       },
-      (v) => (this.plugin.settings.conceptTagMinConfidence = v),
+      (v) => {
+        this.plugin.settings.conceptTagMinConfidence = v;
+        this.plugin.requestPanelRender(); // an open tags mode re-assembles under the changed floor
+      },
     );
 
     // Opt-in model naming of the finished local taxonomy. Local stays the

@@ -10,6 +10,9 @@ import {
   type Debouncer,
 } from "obsidian";
 import type RelatedNotesPlugin from "./main";
+import { renderTaxonomyPreview } from "./tagging/taxonomy-report";
+import type { PanelProposalGroup, TagPanelData } from "./tagging/panel-data";
+import type { TagRewriteProposal } from "./tagging/proposal";
 import type {
   IndexProgress,
   RankedNote,
@@ -45,6 +48,14 @@ export class RelatedNotesView extends ItemView {
   // show the notes the active note LINKS TO — i.e. a MOC's members — as cards.
   private linksMode = false;
   private linksToggleEl!: HTMLElement;
+
+  // "Concept tags" mode (toggled by the header tag icon): the concept-tag pipeline's
+  // live home in the panel — this note's suggested tags and proposal rows, the vault's
+  // pending proposals, and the taxonomy tree, as three sections in one scroll. Every
+  // control opens the plugin's existing review flow; the panel writes nothing here.
+  private tagsMode = false;
+  private tagsToggleEl!: HTMLElement;
+  private tagsSeq = 0; // guards against a stale async tags fill clobbering a newer render
 
   // Pinned ranking source (toggled by the header pin icon): freeze the panel to
   // one note so opening results does not re-anchor it. Holds the TFile instance,
@@ -97,6 +108,12 @@ export class RelatedNotesView extends ItemView {
     });
     setIcon(this.linksToggleEl, "link");
     this.linksToggleEl.addEventListener("click", () => this.toggleLinks());
+    this.tagsToggleEl = actions.createDiv({
+      cls: "rn-tags-toggle clickable-icon",
+      attr: { "aria-label": "Show concept tags for this note and the vault" },
+    });
+    setIcon(this.tagsToggleEl, "tags");
+    this.tagsToggleEl.addEventListener("click", () => this.toggleTags());
     this.pinToggleEl = actions.createDiv({
       cls: "rn-pin-toggle clickable-icon",
       attr: { "aria-label": "Pin the panel to the current note" },
@@ -318,10 +335,26 @@ export class RelatedNotesView extends ItemView {
 
   render(): void {
     if (!this.listEl) return;
+    const renderSeq = ++this.tagsSeq; // any render, to any mode, retires an in-flight tags fill
+    // The tags mode exists only while concept tagging is on. The gate's toggle pokes a
+    // render, which is what live-shows and live-hides the icon without a reload.
+    const conceptTagging = this.plugin.settings.conceptTaggingEnabled;
+    this.tagsToggleEl.toggleClass("is-hidden", !conceptTagging);
+    if (!conceptTagging && this.tagsMode) {
+      this.tagsMode = false; // the gate closing leaves today's panel content unchanged
+      this.tagsToggleEl.removeClass("is-active");
+    }
     // A search is active — its (async) results own the list; don't clobber them.
     if (this.searchQuery) return;
     const active = this.anchorFile();
     this.listEl.empty();
+
+    // Tags mode renders its vault-wide sections even with no active note, so it takes
+    // the null/non-markdown case itself rather than falling through to the recents.
+    if (this.tagsMode) {
+      this.renderTags(renderSeq, active);
+      return;
+    }
 
     if (!active || active.extension !== "md") {
       if (this.linksMode) {
@@ -426,10 +459,33 @@ export class RelatedNotesView extends ItemView {
     this.render();
   }
 
-  // Toggle "linked notes" mode. Mutually exclusive with search (leaving search if open).
+  // Toggle "linked notes" mode. Mutually exclusive with the tags mode and with search
+  // (leaving search if open).
   private toggleLinks(): void {
     this.linksMode = !this.linksMode;
     this.linksToggleEl.toggleClass("is-active", this.linksMode);
+    if (this.tagsMode) {
+      this.tagsMode = false;
+      this.tagsToggleEl.removeClass("is-active");
+    }
+    if (this.searchRowEl.hasClass("is-visible") || this.searchQuery) {
+      this.scheduleSearch.cancel();
+      this.searchInputEl.value = "";
+      this.searchQuery = "";
+      this.searchRowEl.removeClass("is-visible");
+    }
+    this.render();
+  }
+
+  // Toggle the "concept tags" mode: the mirror image of toggleLinks, so the two modes
+  // and search each hand the list back to the others unchanged.
+  private toggleTags(): void {
+    this.tagsMode = !this.tagsMode;
+    this.tagsToggleEl.toggleClass("is-active", this.tagsMode);
+    if (this.linksMode) {
+      this.linksMode = false;
+      this.linksToggleEl.removeClass("is-active");
+    }
     if (this.searchRowEl.hasClass("is-visible") || this.searchQuery) {
       this.scheduleSearch.cancel();
       this.searchInputEl.value = "";
@@ -474,6 +530,133 @@ export class RelatedNotesView extends ItemView {
       card.createDiv({ cls: "rn-path", text: parentPath });
     }
     this.bindCardOpen(card, file);
+  }
+
+  // The tags mode's shell. Sections 2 and 3 read the plugin's vault-wide assembly, so
+  // render() stays synchronous: the subtitle goes up now and the sections land in
+  // renderTagSections once the assembly resolves, guarded against a stale fill.
+  private renderTags(renderSeq: number, active: TFile | null): void {
+    const file = active && active.extension === "md" ? active : null; // no note: sections 2 and 3 only
+    this.subtitleEl.empty();
+    this.subtitleEl.appendText("Concept tags");
+    if (file) {
+      this.subtitleEl.appendText(" for ");
+      this.subtitleEl.createSpan({ cls: "rn-based-on", text: file.basename });
+      if (this.pinnedFile) this.subtitleEl.appendText(" (pinned)");
+    }
+    void this.renderTagSections(renderSeq, file);
+  }
+
+  // The three sections in order: this note's suggestions, the vault's pending rows,
+  // the taxonomy tree. Candidates are read AFTER the assembly resolves, because the
+  // taxonomy they come from is what that call computes on a fresh generation.
+  private async renderTagSections(renderSeq: number, file: TFile | null): Promise<void> {
+    let data: TagPanelData | null;
+    let taxonomyLines: string[];
+    try {
+      data = await this.plugin.tagPanelDataFor(file);
+      taxonomyLines = renderTaxonomyPreview(await this.plugin.currentTaxonomy());
+    } catch {
+      return; // a failed read leaves the mode blank until the next poke — never an unhandled rejection
+    }
+    if (renderSeq !== this.tagsSeq || !this.tagsMode || this.searchQuery) return; // superseded
+    if (!data) return; // gate closed mid-flight: the gate's own poke renders the panel without this mode
+    const rows = data.forNote?.proposals ?? [];
+    this.renderTagNoteSection(file, file ? this.plugin.conceptTagCandidatesFor(file.path) : [], rows);
+    this.renderTagVaultSection(data.vault);
+    this.renderTagTaxonomySection(taxonomyLines);
+    // Sections hide themselves when they have nothing; all three hidden is the mode's
+    // one empty state, in the panel's own quiet tone.
+    if (this.listEl.children.length === 0) this.renderEmpty("No concept tags to review yet.");
+  }
+
+  // Section 1: the note's suggested tags and its proposal rows. Unlike the reader's
+  // chips these write nothing — the apply control opens the existing review modal.
+  private renderTagNoteSection(file: TFile | null, suggestions: string[], rows: TagRewriteProposal[]): void {
+    if (!file || (suggestions.length === 0 && rows.length === 0)) return;
+    if (suggestions.length > 0) {
+      const chips = this.listEl.createDiv({ cls: "rn-tagchips" });
+      chips.createSpan({ cls: "rn-tagchips-label", text: "Suggested:" });
+      for (const tag of suggestions) {
+        const chip = chips.createSpan({ cls: "rn-chip", text: `#${tag}` });
+        chip.setAttr("aria-label", `Suggested concept tag #${tag}. Apply it with the review below.`);
+      }
+    }
+    for (const proposal of rows) this.renderTagProposalRow(proposal);
+    if (rows.length === 0) return; // nothing to apply: no control
+    const head = this.listEl.createDiv({ cls: "rn-tagchips" });
+    head.createSpan({ cls: "rn-tagchips-label", text: "Apply to this note" });
+    const apply = head.createDiv({
+      cls: "clickable-icon",
+      attr: { "aria-label": `Apply ${file.basename}'s concept tag proposals in the review modal` },
+    });
+    setIcon(apply, "check");
+    apply.addEventListener("click", (e) => {
+      e.stopPropagation();
+      void this.plugin.reviewConceptTags(file);
+    });
+  }
+
+  // One proposal as a muted detail line: the tag, what it replaces, its confidence and
+  // the detector's receipt — the same facts the review modal and the report show.
+  private renderTagProposalRow(proposal: TagRewriteProposal): void {
+    const replaces = proposal.replacesTag ? ` replaces #${proposal.replacesTag}` : "";
+    const pct = Math.round(proposal.confidence * 100); // integer percent, as the report writes it
+    this.listEl
+      .createDiv({ cls: "rn-snippet" })
+      .setText(`#${proposal.tagPath}${replaces} · ${pct}% · ${proposal.evidence}`);
+  }
+
+  // Section 2: the vault's pending rows, one row per note, in the delivered order. Both
+  // controls route through the plugin's review flow — the single gate for every write.
+  private renderTagVaultSection(groups: PanelProposalGroup[]): void {
+    if (groups.length === 0) return;
+    const total = groups.reduce((sum, group) => sum + group.proposals.length, 0);
+    const head = this.listEl.createDiv({ cls: "rn-tagchips" });
+    head.createSpan({ cls: "rn-tagchips-label", text: `Pending vault proposals (${total})` });
+    const reviewAll = head.createDiv({
+      cls: "clickable-icon",
+      attr: { "aria-label": "Review all vault proposals" },
+    });
+    setIcon(reviewAll, "check");
+    reviewAll.addEventListener("click", (e) => {
+      e.stopPropagation();
+      void this.plugin.reviewConceptTags();
+    });
+    for (const group of groups) this.renderTagVaultRow(group);
+  }
+
+  // One note's rows as a card: the note, how many rows are pending, and the review
+  // opener. A path that no longer resolves stays in the list, inert.
+  private renderTagVaultRow(group: PanelProposalGroup): void {
+    const found = this.app.vault.getAbstractFileByPath(group.notePath);
+    const note = found instanceof TFile ? found : null; // deleted since the assembly: an inert row
+    const count = group.proposals.length;
+    const card = this.listEl.createDiv({ cls: "rn-card" });
+    const top = card.createDiv({ cls: "rn-card-top" });
+    top.createDiv({ cls: "rn-title", text: note ? note.basename : group.notePath });
+    if (note) {
+      const review = top.createDiv({
+        cls: "clickable-icon",
+        attr: { "aria-label": `Review the concept tag proposals for ${group.notePath}` },
+      });
+      setIcon(review, "check");
+      review.addEventListener("click", (e) => {
+        e.stopPropagation(); // the card's own click opens the same modal: once is enough
+        void this.plugin.reviewConceptTags(note);
+      });
+    }
+    const pending = count === 1 ? "1 proposal" : `${count} proposals`;
+    card.createDiv({ cls: "rn-tagchips-label", text: `${pending} · ${group.notePath}` });
+    if (!note) return;
+    card.addEventListener("click", () => void this.plugin.reviewConceptTags(note));
+  }
+
+  // Section 3: the taxonomy preview VERBATIM. The lines' own indentation is the tree,
+  // so they go into a preformatted block whole — nothing re-derived or restyled here.
+  private renderTagTaxonomySection(lines: string[]): void {
+    if (lines.length === 0) return; // "nothing to show", the way the report and the preview command read it
+    this.listEl.createEl("pre", { cls: "rn-taxonomy-preview", text: lines.join("\n") });
   }
 
   // Semantic search: rank notes by similarity to the typed query (keyword fallback

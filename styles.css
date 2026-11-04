@@ -48,14 +48,20 @@
 }
 .related-notes-view .rn-search-toggle,
 .related-notes-view .rn-links-toggle,
+.related-notes-view .rn-tags-toggle,
 .related-notes-view .rn-pin-toggle {
   color: var(--text-muted);
   cursor: pointer;
 }
 /* Active mode (e.g. linked-notes mode on, or a pinned source) reads as accent so the toggle's state is clear. */
 .related-notes-view .rn-links-toggle.is-active,
+.related-notes-view .rn-tags-toggle.is-active,
 .related-notes-view .rn-pin-toggle.is-active {
   color: var(--interactive-accent);
+}
+/* The tags mode belongs to concept tagging, so the render path hides this icon while that setting is off. */
+.related-notes-view .rn-tags-toggle.is-hidden {
+  display: none;
 }
 .related-notes-view .rn-search-row {
   display: none;
@@ -577,6 +583,20 @@
 }
 .rn-chip-x:hover {
   color: var(--text-normal);
+}
+
+/* Tags mode: the taxonomy preview, verbatim. The report's two-space indents ARE the
+   tree, so the block preserves whitespace instead of wrapping like card text. */
+.related-notes-view .rn-taxonomy-preview {
+  margin: 0;
+  padding: var(--size-4-2) var(--size-4-3);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-m);
+  background-color: var(--background-primary);
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+  white-space: pre;
+  overflow-x: auto;
 }
 
 /* What's-new popup (one-time, after a feature update). */
