@@ -1,10 +1,29 @@
 // Unit tests for the concept-tag pipeline's mutation core: offline, synthetic, in-memory ports.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-// Node's type stripping needs the ".ts" specifier; tsc flags it only because tsconfig (not ours to edit)
-// omits allowImportingTsExtensions. The expect-error pins the one tsc complaint, nothing else.
-// @ts-expect-error
-import { applyTagProposals, type ApplyFrontmatterPort, type ApplyNoteOutput, type ApplySideChannels } from "./apply.ts";
+import { register } from "node:module";
+
+// tsc (moduleResolution Bundler, no allowImportingTsExtensions) only charges ".ts"
+// specifiers on value imports, so this type-only import needs no directive.
+import type { ApplyFrontmatterPort, ApplyNoteOutput, ApplySideChannels } from "./apply.ts";
+
+// apply.ts value-imports "./detectors.ts", whose own extensionless "./proposal" node
+// never rewrites (proven: ERR_MODULE_NOT_FOUND), so the in-file resolve hook the house
+// pins in detectors.test.ts maps exactly that specifier — registered here, BEFORE the
+// load below, because static value imports link before any module body runs.
+const dataUrl = (src: string): string => "data:text/javascript," + encodeURIComponent(src);
+register(
+  dataUrl(
+    "export async function resolve(specifier, context, next) {\n" +
+      "  if (specifier === \"./proposal\") return next(\"./proposal.ts\", context);\n" +
+      "  return next(specifier, context);\n" +
+      "}\n",
+  ),
+  import.meta.url,
+);
+// @ts-expect-error — a dynamic VALUE import: type stripping still needs the ".ts"
+// specifier and tsc still charges it; the hook above is live before this resolves.
+const { applyTagProposals } = await import("./apply.ts");
 import type { InlineEditRecord, InlineRewriteBatch } from "./inline-rewrite.ts";
 import type { TagRewriteProposal } from "./proposal.ts";
 
@@ -77,6 +96,69 @@ void test("case-insensitive dedupe keeps the existing form and writes nothing", 
   assert.deepEqual(note.tagsAfter, []); // [] when nothing was written
   assert.deepEqual(note.skippedProposals, [{ tagPath: "City", reason: "already-present" }]);
   assert.equal(result.mutatedNoteCount, 0);
+});
+
+void test("the already-present skip compares both sides in the pinned form cleanTag(tag).toLowerCase()", async () => {
+  // A carried mangled-separator form is the same tag as its clean intent — the
+  // exact malformations the normalization detectors exist to find — so the
+  // additive append is suppressed: never a near-duplicate beside the carried
+  // form, and the panel hides no row apply would write (one rule, both sides).
+  const a = memoryPort({ "notes/ma.md": ["City//"] });
+  const ra = await applyTagProposals([proposal("notes/ma.md", "City")], a.port);
+  assert.equal(a.writeLog.length, 0);                        // all-skipped notes are never written
+  assert.deepEqual(a.store.get("notes/ma.md"), ["City//"]);  // the carried form stands, untouched
+  assert.deepEqual(ra.notes[0].tagsBefore, ["City//"]);
+  assert.deepEqual(ra.notes[0].tagsAfter, []);               // [] when nothing was written
+  assert.deepEqual(ra.notes[0].skippedProposals, [{ tagPath: "City", reason: "already-present" }]);
+  assert.equal(ra.mutatedNoteCount, 0);
+
+  // The one leading '#' and the case fold through the same pinned form: a
+  // carried #Goa/Character is the tag goa/character proposes to add.
+  const b = memoryPort({ "notes/mb.md": ["#Goa/Character"] });
+  const rb = await applyTagProposals([proposal("notes/mb.md", "goa/character")], b.port);
+  assert.equal(b.writeLog.length, 0);
+  assert.deepEqual(b.store.get("notes/mb.md"), ["#Goa/Character"]);
+  assert.deepEqual(rb.notes[0].skippedProposals, [{ tagPath: "goa/character", reason: "already-present" }]);
+
+  // The proposal side is cleaned too, not only the carried side.
+  const c = memoryPort({ "notes/mc.md": ["City"] });
+  const rc = await applyTagProposals([proposal("notes/mc.md", "City//")], c.port);
+  assert.equal(c.writeLog.length, 0);
+  assert.deepEqual(c.store.get("notes/mc.md"), ["City"]);
+  assert.deepEqual(rc.notes[0].skippedProposals, [{ tagPath: "City//", reason: "already-present" }]);
+});
+
+void test("the pinned-form skip never swallows a rewrite: the mangled tag is still a normalization's raw material", async () => {
+  // One call, both kinds: the additive for the mangled City// skips already-present,
+  // while the normalization rewriting the mangled Physics//MRI still fires beside it.
+  const d = memoryPort({ "notes/md.md": ["City//", "Physics//MRI"] });
+  const rd = await applyTagProposals(
+    [
+      proposal("notes/md.md", "City"), // the skip governs additive appends only
+      proposal("notes/md.md", "Physics/MRI", { kind: "normalization", replacesTag: "Physics//MRI" }),
+    ],
+    d.port,
+  );
+  assert.deepEqual(d.writeLog, [{ notePath: "notes/md.md", tags: ["City//", "Physics/MRI"] }]);
+  assert.deepEqual(rd.notes[0].appliedProposals, [
+    { kind: "normalization", tagPath: "Physics/MRI", replacesTag: "Physics//MRI",
+      addedTags: ["Physics/MRI"], removedTags: ["Physics//MRI"] },
+  ]);
+  assert.deepEqual(rd.notes[0].skippedProposals, [{ tagPath: "City", reason: "already-present" }]);
+  assert.equal(rd.mutatedNoteCount, 1);
+
+  // And the very mangled tag whose additive skipped — City// — is the rewrite's
+  // raw material in its own call: the skip never swallows a normalization.
+  const e = memoryPort({ "notes/me.md": ["City//"] });
+  const re = await applyTagProposals(
+    [proposal("notes/me.md", "City", { kind: "normalization", replacesTag: "City//" })],
+    e.port,
+  );
+  assert.deepEqual(e.writeLog, [{ notePath: "notes/me.md", tags: ["City"] }]);
+  assert.deepEqual(re.notes[0].appliedProposals, [
+    { kind: "normalization", tagPath: "City", replacesTag: "City//", addedTags: ["City"], removedTags: ["City//"] },
+  ]);
+  assert.deepEqual(re.notes[0].skippedProposals, []); // the rewrite applied; nothing skipped
 });
 
 void test("replacesTag displaces every exact occurrence and appends the new form", async () => {

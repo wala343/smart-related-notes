@@ -1,15 +1,28 @@
 // Unit tests for the tagging command layer: offline, synthetic, scripted in-memory ports.
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { register } from "node:module";
 import type { TagRewriteProposal } from "./proposal";
 import type { ApplyFrontmatterPort } from "./apply";
 import type { LedgerEntry, LedgerStoragePort } from "./ledger";
 import type { InlineRewriteAccess, InlineTagSpan } from "./inline-rewrite";
 import type { TaggingCommandPort } from "./commands";
-// Node's type stripping needs the ".ts" specifier; tsc flags it only because tsconfig (not ours to edit)
-// omits allowImportingTsExtensions. The expect-error pins the one tsc complaint, nothing else.
-// @ts-expect-error
-import { applySelectedProposals, filterAdditiveProposals, previewTaxonomy, revertTagChanges } from "./commands.ts";
+// commands.ts value-imports "./apply.ts", which value-imports "./detectors.ts" — whose own
+// extensionless "./proposal" node never rewrites. The in-file resolve hook the house pins
+// in detectors.test.ts maps that one specifier, registered BEFORE the dynamic load below.
+const dataUrl = (src: string): string => "data:text/javascript," + encodeURIComponent(src);
+register(
+  dataUrl(
+    "export async function resolve(specifier, context, next) {\n" +
+      "  if (specifier === \"./proposal\") return next(\"./proposal.ts\", context);\n" +
+      "  return next(specifier, context);\n" +
+      "}\n",
+  ),
+  import.meta.url,
+);
+// @ts-expect-error — a dynamic VALUE import: type stripping still needs the ".ts"
+// specifier and tsc still charges it; the hook above is live before this resolves.
+const { applySelectedProposals, filterAdditiveProposals, previewTaxonomy, revertTagChanges } = await import("./commands.ts");
 
 const NOW = 1_730_000_000_000; // fixed clock: every timestamp is injected through the port
 const DAY = 86_400_000;

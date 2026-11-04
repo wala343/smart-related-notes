@@ -25,6 +25,10 @@
 
 import type { InlineEditRecord, InlineRewriteBatch } from "./inline-rewrite";
 import type { ProposalKind, TagRewriteProposal } from "./proposal";
+// Value imports need the ".ts" specifier for Node's runtime (the test chain has
+// no extension resolution); the expect-error pins the one tsc complaint.
+// @ts-expect-error
+import { cleanTag } from "./detectors.ts";
 
 // The only storage seam. readNoteTags returns null when the note has no `tags:`
 // frontmatter key ([] means the key exists and is empty). writeNoteTags replaces
@@ -37,7 +41,7 @@ export interface ApplyFrontmatterPort {
 
 // The machine word for why a proposal did not land.
 export type ApplySkipReason =
-  | "already-present"        // case-insensitive dedupe matched an existing tag
+  | "already-present"        // dedupe in the pinned comparison form matched an existing tag
   | "duplicate-proposal"     // same note + tag path proposed again in this call
   | "replacement-not-found"  // replacesTag matched no exact frontmatter tag and no batch group
   | "malformed-proposal"     // tag path empty after trimming
@@ -90,9 +94,15 @@ export interface ApplySideChannels {
   commitNoteRewrite?(notePath: string): Promise<"committed" | "drifted">;
 }
 
-// The case fold behind every dedupe check. No other normalization happens
-// anywhere in this module, so toLowerCase is the whole of it.
+// The bare case fold behind the duplicate-proposal claim and the replacement
+// suppression checks (pinned 0009/0019): those stay exactly as they are. The
+// already-present skip compares in the tag domain's pinned form below instead.
 const fold = (s: string): string => s.toLowerCase();
+
+// The tag domain's pinned comparison form (order 0005) — the identical rule the
+// panel-data dedupe compares by: cleanTag precedes the case fold, so a carried
+// City//, #City, or City/ is the same tag as City in the already-present skip.
+const canonicalTag = (s: string): string => cleanTag(s).toLowerCase();
 
 // The only entry point: group proposals per note (notes come out in the order
 // each first faces a proposal), process them in call order against a per-note
@@ -191,9 +201,10 @@ async function applyToNote(
 
     if (replacesTag === null || replacesTag === "") {
       // Append-only merge: existing tags keep their order and exact forms, and
-      // the EXISTING form wins a case-insensitive match — never rewritten.
-      // Additives are never deferred: they apply to the working list at once.
-      if (tags.some((t) => fold(t) === key)) {
+      // the EXISTING form wins a match in the pinned comparison form — never
+      // rewritten. Additives are never deferred: they apply at once.
+      const canonicalKey = canonicalTag(tagPath);
+      if (tags.some((t) => canonicalTag(t) === canonicalKey)) {
         skipped.push({ tagPath, reason: "already-present" });
         continue;
       }
