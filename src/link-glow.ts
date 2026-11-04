@@ -251,21 +251,23 @@ export function detectMentions(
   return out;
 }
 
-// Build the wikilink text for a surface. When the surface is an ALIAS of the
-// target (not its basename) we keep the user's surface as the display text:
-// `[[Note|Surface]]`; otherwise a plain `[[Note]]`. The target uses the file's
-// basename (Obsidian resolves it; this matches the vault's short-link style and
-// coexists with easy-links' path hiding without fighting its `Folder/` collapse).
+// Build the wikilink text for a surface. The typed surface is PRESERVED
+// verbatim: an EXACT match against the note's basename collapses to a plain
+// `[[basename]]`; everything else (an alias, a different casing) links as
+// `[[basename|surface]]` with the text exactly as typed. The target uses the
+// file's basename (Obsidian resolves it; this matches the vault's short-link
+// style and coexists with easy-links' path hiding without fighting its
+// `Folder/` collapse).
 export function buildWikiLink(
   file: TFile,
   surface: string,
   titleIndex: TitleIndex,
 ): string {
-  const target = file.basename;
-  if (titleIndex.isAlias(surface, file)) {
-    return `[[${target}|${surface}]]`;
-  }
-  return `[[${target}]]`;
+  // The link text now depends only on the typed surface and the basename;
+  // titleIndex stays in the signature because main.ts and the suggester pass it.
+  return surface === file.basename
+    ? `[[${file.basename}]]`
+    : `[[${file.basename}|${surface}]]`;
 }
 
 // Apply a set of mentions as wikilinks to an editor in ONE undo step, from LAST

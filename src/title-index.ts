@@ -51,14 +51,13 @@ export class TitleIndex {
     this.excludedFolders = excludedFolders;
   }
 
-  // Normalize a surface for comparison and as a map key:
-  //   NFC first so a composed "ü" and a decomposed "u+¨" compare equal,
-  //   then toLocaleLowerCase for German sharp-s / dotted-I correctness,
-  //   then trim + collapse internal whitespace to a single space.
+  // Normalize a surface for comparison and as a map key: NFC first so a
+  // composed "ü" and a decomposed "u+¨" compare equal, then trim + collapse
+  // internal whitespace to a single space. Case is PRESERVED — deliberate:
+  // mention matching is exact-case and the typed link text survives verbatim.
   normalize(s: string): string {
     return s
       .normalize("NFC")
-      .toLocaleLowerCase()
       .trim()
       .replace(/\s+/g, " ");
   }
@@ -174,11 +173,11 @@ export class TitleIndex {
   // The boundaries are Unicode-aware lookbehind/lookahead asserting the char
   // before and after the match is NOT a letter or number (\p{L}/\p{N}) — NOT the
   // ASCII word boundary \b, which mis-handles umlauts and sharp-s. Flags: global
-  // + ignorecase + unicode. (Surfaces are matched against the RAW document text,
-  // so we rely on the 'i' flag rather than pre-lowercasing — the alternation
-  // members are the normalized lower-cased surfaces, which 'i' matches in either
-  // case for the ASCII range; non-ASCII letters in titles are matched verbatim
-  // because they were NFC-normalized identically on both sides.)
+  // + unicode, never ignorecase. (Surfaces are matched against the RAW document
+  // text and the alternation members are the normalized case-PRESERVED surfaces,
+  // so matching is exact-case: a mention resolves only when typed with the
+  // note's or alias's exact casing; non-ASCII letters match verbatim because
+  // both sides are NFC-normalized identically.)
   compiledFor(activePath: string): RegExp | null {
     this.ensureFresh();
     if (this.compiled && this.compiledForPath === activePath) {
@@ -225,7 +224,7 @@ export class TitleIndex {
 
     let regex: RegExp | null;
     try {
-      regex = new RegExp(pattern, "giu");
+      regex = new RegExp(pattern, "gu");
     } catch {
       // A pathological surface set could in theory exceed an engine limit; fail
       // closed (no glow) rather than throw out of the ViewPlugin.
