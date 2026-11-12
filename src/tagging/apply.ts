@@ -36,7 +36,7 @@ import { cleanTag } from "./detectors.ts";
 // absent, and leaves every other frontmatter key untouched (port invariant).
 export interface ApplyFrontmatterPort {
   readNoteTags(notePath: string): Promise<string[] | null>;
-  writeNoteTags(notePath: string, tags: string[]): Promise<void>;
+  writeNoteTags(notePath: string, tags: string[], canMutate?: () => boolean): Promise<void>;
 }
 
 // The machine word for why a proposal did not land.

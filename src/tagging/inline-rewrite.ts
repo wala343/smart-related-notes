@@ -37,7 +37,7 @@ export interface InlineEditRecord {
 // note content and the live cache's spans, and writes text back.
 export interface InlineRewriteAccess {
   readNoteContent(notePath: string): Promise<string | null>; // null: note missing
-  writeNoteContent(notePath: string, text: string): Promise<void>;
+  writeNoteContent(notePath: string, text: string, canMutate?: () => boolean): Promise<void>;
   inlineTagSpans(notePath: string): Promise<InlineTagSpan[]>; // live cache positions; code fences excluded by construction
 }
 

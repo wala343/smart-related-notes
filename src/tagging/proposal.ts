@@ -30,6 +30,13 @@ export interface TaxonomyResult {
   leafAssignment: Map<string, string>;// every input note path -> deepest node's tag path
 }
 
+export interface ConceptTagMembership {
+  notePath: string;
+  tagPath: string;
+  confidence: number;
+  evidence: string;
+}
+
 // The only way a tag path string is formed from segments — the single normalization point.
 export function joinSegments(segments: string[]): string {
   if (segments.length === 0) throw new TypeError("tag path needs at least one segment");

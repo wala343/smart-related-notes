@@ -573,6 +573,14 @@
   align-items: center;
   gap: 4px;
 }
+button.rn-chip {
+  background: transparent;
+  font: inherit;
+}
+.rn-chip:disabled {
+  cursor: wait;
+  opacity: 0.6;
+}
 .rn-chip:hover {
   color: var(--text-normal);
   border-color: var(--text-faint);

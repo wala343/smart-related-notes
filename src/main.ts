@@ -75,7 +75,6 @@ import {
   previewTaxonomy,
   revertTagChanges,
 } from "./tagging/commands";
-import { detectNormalization, detectPlacement } from "./tagging/detectors";
 import {
   computeInlineRewrite,
   type InlineRewriteAccess,
@@ -362,23 +361,32 @@ export default class RelatedNotesPlugin extends Plugin {
   // generation of the store's load/build completion transitions (indexEpoch).
   private conceptTaxonomy: TaxonomyResult | null = null;
   private conceptTaxonomyIndexMtime: number | null = null;
+  private conceptTaxonomyEpoch = 0;
   // The naming settings the cached taxonomy was produced under: the cache holds
   // only while BOTH this and the index epoch still match the settings.
   private conceptTaxonomyNamingKey: string | null = null;
-  // Reader-host memo: note path -> taxonomy leaf + proposal tag paths. Emptied
-  // whenever the taxonomy is invalidated or recomputed.
-  private conceptTagCandidates: Map<string, string[]> | null = null;
+  // Reader-host memo keyed by the same epoch, taxonomy scope and confidence
+  // floor as the proposal assembly that produced it.
+  private conceptTagCandidates: { key: string; byNote: Map<string, string[]> } | null = null;
   // --- concept tag panel cache ---
-  // The tags panel's assembly memo: the vault-wide proposal list, the per-note
-  // carried tags read with it, and the (index epoch, naming key, confidence floor)
-  // key all three were built under. A key mismatch on the next call IS the
-  // invalidation, so this clears on the same signals as the taxonomy cache above.
+  // The tags panel keeps one active-note result. Vault review is explicit and uses
+  // its own flight, so visiting the panel never retains a vault-wide proposal list.
   private tagPanelMemo: {
     proposals: TagRewriteProposal[];
     carriedTags: Map<string, string[]>;
     key: string;
+    notePath: string;
   } | null = null;
+  private taxonomyInFlight: Promise<TaxonomyResult> | null = null;
+  private tagAssemblyInFlight: { key: string; promise: Promise<TagRewriteProposal[]> } | null = null;
+  private tagNoteAssemblyInFlight = new Map<string, { key: string; promise: Promise<TagRewriteProposal[]> }>();
+  private conceptNamingTextCache = new Map<string, { revision: string; text: string }>();
+  private conceptTagOnlyDirtyPaths = new Set<string>();
+  private conceptGeometryUpdateFlight: Promise<void> | null = null;
+  private isConceptRefreshStopped = false;
+  tagAssemblyProgress: { completed: number; total: number } | null = null;
   private indexEpoch = 0;
+  private conceptEvidenceEpoch = 0;
   private lastIndexProgressStatus: IndexStatus = "idle";
   // Self-write suppression: the count of in-flight tagging-pipeline write
   // sequences (commands + auto-apply). The modify handler's auto-apply arm
@@ -400,6 +408,7 @@ export default class RelatedNotesPlugin extends Plugin {
   private appliedMaxChunks!: number;
   private appliedShowSummary!: boolean;
   private appliedHeadingContext!: boolean;
+  private appliedExcludeFoldersKey!: string;
   // Guards the engine-swap + rebuild path against re-entrancy.
   private swapping = false;
 
@@ -468,6 +477,7 @@ export default class RelatedNotesPlugin extends Plugin {
     this.appliedMaxChunks = this.settings.maxChunks;
     this.appliedShowSummary = this.settings.showSummary;
     this.appliedHeadingContext = this.settings.headingContext;
+    this.appliedExcludeFoldersKey = this.excludeFoldersKey();
     this.store = new IndexStore(
       this.app,
       this.engine,
@@ -485,7 +495,10 @@ export default class RelatedNotesPlugin extends Plugin {
     this.store.onProgress((p) => {
       if (p.status === this.lastIndexProgressStatus) return;
       this.lastIndexProgressStatus = p.status;
-      if (p.status === "ready") this.indexEpoch += 1;
+      if (p.status === "ready") {
+        this.indexEpoch += 1;
+        this.conceptTaxonomyEpoch += 1;
+      }
       if (p.status !== "idle") this.invalidateConceptTaxonomy();
     });
     // Idle auto-unload: free the engine's memory after a quiet period.
@@ -592,7 +605,7 @@ export default class RelatedNotesPlugin extends Plugin {
       id: "revert-tag-changes",
       name: "Revert applied tag changes",
       callback: () => {
-        void this.runTaggingCommand(revertTagChanges);
+        void this.runTaggingCommand(revertTagChanges, true);
       },
     });
 
@@ -657,39 +670,14 @@ export default class RelatedNotesPlugin extends Plugin {
     // while typing) never kicks off embeddings — only a real edit pause does.
     this.debouncedUpdate = debounce(() => void this.flushDirty(), 20000, false);
 
-    this.registerEvent(
-      this.app.vault.on("modify", (file) => {
-        if (file instanceof TFile && file.extension === "md") {
-          this.dirty.add(file.path);
-          this.debouncedUpdate(file);
-          // Title text can change on a modify; refresh the (cheap) title index too.
-          this.debouncedTitleRefresh();
-          // Idle auto-link the active note's later mentions (opt-in; cursor-aware,
-          // re-validating) only when this is the active file.
-          if (
-            this.settings.autoLinkSubsequent &&
-            file.path === this.app.workspace.getActiveFile()?.path
-          ) {
-            this.debouncedAutoLink(file.path);
-          }
-          // Idle concept-tag auto-apply for the changed note (opt-in). Unlike
-          // auto-link it is not cursor-bound; the undo ledger makes it revertible.
-          // The in-flight counter is the self-write guard: a tagging pipeline
-          // write's own modify event (a revert's above all) must not re-arm.
-          if (
-            this.settings.conceptTaggingEnabled &&
-            this.settings.autoApplyConceptTags &&
-            this.taggingWritesInFlight === 0
-          ) {
-            this.debouncedAutoApplyConceptTags(file.path);
-          }
-        }
-      }),
-    );
+    this.registerConceptRefreshEvents();
     this.registerEvent(
       this.app.vault.on("create", (file) => {
         if (file instanceof TFile && file.extension === "md") {
           this.dirty.add(file.path);
+          this.conceptEvidenceEpoch += 1;
+          this.conceptTaxonomyEpoch += 1;
+          this.invalidateConceptTaxonomy();
           this.debouncedUpdate(file);
           this.titleIndex.markDirty();
           this.debouncedTitleRefresh();
@@ -698,7 +686,12 @@ export default class RelatedNotesPlugin extends Plugin {
     );
     this.registerEvent(
       this.app.vault.on("delete", (file: TAbstractFile) => {
+        this.conceptEvidenceEpoch += 1;
         this.store.removeFile(file.path);
+        this.conceptNamingTextCache.delete(file.path);
+        this.conceptTagOnlyDirtyPaths.delete(file.path);
+        this.conceptTaxonomyEpoch += 1;
+        this.invalidateConceptTaxonomy();
         this.snippetCache.delete(file.path);
         this.titleIndex.markDirty();
         this.suggester?.invalidateAliasCache(file.path);
@@ -706,35 +699,7 @@ export default class RelatedNotesPlugin extends Plugin {
         this.getView()?.requestRender();
       }),
     );
-    this.registerEvent(
-      this.app.vault.on("rename", (file, oldPath) => {
-        this.snippetCache.delete(oldPath);
-        if (file instanceof TFile && file.extension === "md") {
-          this.store.renameFile(oldPath, file);
-        } else {
-          this.store.removeFile(oldPath);
-        }
-        this.titleIndex.markDirty();
-        this.suggester?.invalidateAliasCache(oldPath);
-        if (file instanceof TFile) this.suggester?.invalidateAliasCache(file.path);
-        this.debouncedTitleRefresh();
-        this.getView()?.requestRender();
-      }),
-    );
-    // Aliases change without bumping mtime, so drop caches on the metadata
-    // 'changed' event (the exact reason easy-links does too).
-    this.registerEvent(
-      this.app.metadataCache.on("changed", (file) => {
-        this.titleIndex.markDirty();
-        this.suggester?.invalidateAliasCache(file.path);
-        this.debouncedTitleRefresh();
-        // Editing a note can add or remove wikilinks, which changes the structural
-        // channel's adjacency. Rebuilding it is a single pass over resolvedLinks
-        // with no model work, so invalidating eagerly is cheaper than tracking
-        // which links actually moved.
-        this.store.invalidateGraph();
-      }),
-    );
+    this.registerConceptRenameEvent();
     // resolvedLinks is only authoritative once Obsidian has resolved the whole
     // vault; before that the structural channel would see a partial graph.
     this.registerEvent(
@@ -754,6 +719,100 @@ export default class RelatedNotesPlugin extends Plugin {
       this.applySuggesterPrecedence();
       this.maybeShowWhatsNew();
     });
+  }
+
+  private registerConceptRefreshEvents(): void {
+    this.registerEvent(
+      this.app.vault.on("modify", (file) => {
+        if (!(file instanceof TFile) || file.extension !== "md") return;
+        this.dirty.add(file.path);
+        this.conceptEvidenceEpoch += 1;
+        this.conceptTaxonomyEpoch += 1;
+        this.invalidateConceptTaxonomy();
+        this.getView()?.requestRender();
+        if (this.taggingWritesInFlight === 0) this.conceptTagOnlyDirtyPaths.delete(file.path);
+        this.debouncedUpdate(file);
+        this.debouncedTitleRefresh();
+        if (
+          this.settings.autoLinkSubsequent &&
+          file.path === this.app.workspace.getActiveFile()?.path
+        ) this.debouncedAutoLink(file.path);
+        if (
+          this.settings.conceptTaggingEnabled &&
+          this.settings.autoApplyConceptTags &&
+          this.taggingWritesInFlight === 0
+        ) this.debouncedAutoApplyConceptTags(file.path);
+      }),
+    );
+    // Metadata can settle after modify; its own revision prevents the earlier
+    // same-key proposal flight from republishing stale candidates.
+    this.registerEvent(
+      this.app.metadataCache.on("changed", (file) => {
+        this.conceptEvidenceEpoch += 1;
+        this.titleIndex.markDirty();
+        this.suggester?.invalidateAliasCache(file.path);
+        this.debouncedTitleRefresh();
+        this.store.invalidateGraph();
+        if (this.store.refreshConceptEligibility(file.path)) {
+          this.dirty.add(file.path);
+          this.debouncedUpdate(file);
+          this.conceptTaxonomyEpoch += 1;
+          this.invalidateConceptTaxonomy();
+        } else {
+          this.invalidateConceptTagProposals();
+        }
+        this.getView()?.requestRender();
+      }),
+    );
+  }
+
+  private registerConceptRenameEvent(): void {
+    this.registerEvent(
+      this.app.vault.on("rename", (renamedFile, oldPath) => {
+        let renamedMarkdownFiles: { file: TFile; oldPath: string }[] = [];
+        if (renamedFile instanceof TFile) {
+          if (renamedFile.extension === "md") renamedMarkdownFiles = [{ file: renamedFile, oldPath }];
+        } else {
+          renamedMarkdownFiles = this.app.vault.getMarkdownFiles()
+            .filter((file) => file.path.startsWith(`${renamedFile.path}/`))
+            .map((file) => ({
+              file,
+              oldPath: `${oldPath}${file.path.slice(renamedFile.path.length)}`,
+            }));
+        }
+
+        this.conceptEvidenceEpoch += 1;
+        this.snippetCache.delete(oldPath);
+        this.conceptNamingTextCache.delete(oldPath);
+        this.conceptTagOnlyDirtyPaths.delete(oldPath);
+        this.dirty.delete(oldPath);
+        if (renamedMarkdownFiles.length === 0) this.store.removeFile(oldPath);
+        for (const renamed of renamedMarkdownFiles) {
+          this.dirty.delete(renamed.oldPath);
+          this.store.renameFile(renamed.oldPath);
+          this.snippetCache.delete(renamed.oldPath);
+          this.conceptNamingTextCache.delete(renamed.oldPath);
+          this.conceptNamingTextCache.delete(renamed.file.path);
+          this.conceptTagOnlyDirtyPaths.delete(renamed.oldPath);
+          this.conceptTagOnlyDirtyPaths.delete(renamed.file.path);
+          this.dirty.add(renamed.file.path);
+          this.suggester?.invalidateAliasCache(renamed.oldPath);
+          this.suggester?.invalidateAliasCache(renamed.file.path);
+        }
+        this.conceptTaxonomyEpoch += 1;
+        this.invalidateConceptTaxonomy();
+        this.titleIndex.markDirty();
+        this.suggester?.invalidateAliasCache(oldPath);
+        if (renamedFile instanceof TFile) this.suggester?.invalidateAliasCache(renamedFile.path);
+        this.debouncedTitleRefresh();
+        this.getView()?.requestRender();
+        if (renamedMarkdownFiles.length > 0) {
+          void this.flushDirty().catch((error) => {
+            console.warn("[related-notes] rename re-index failed; retry remains queued", error);
+          });
+        }
+      }),
+    );
   }
 
   // After a feature update, show the bundled highlights once. Slightly delayed
@@ -777,6 +836,7 @@ export default class RelatedNotesPlugin extends Plugin {
   }
 
   onunload(): void {
+    this.isConceptRefreshStopped = true;
     // Cancel armed debouncers so a pending timer (the 20s re-embed flush
     // especially) can't fire into the unloaded plugin.
     this.debouncedUpdate?.cancel();
@@ -899,9 +959,11 @@ export default class RelatedNotesPlugin extends Plugin {
       markdownFiles: () =>
         this.app.vault.getMarkdownFiles().filter((f) => !this.store.isExcluded(f.path)),
       fileByPath: (path) => {
+        if (this.store.isExcluded(path)) return null;
         const f = this.app.vault.getAbstractFileByPath(path);
         return f instanceof TFile ? f : null;
       },
+      conceptTagEligible: (path) => this.store.isConceptTagEligible(path),
       fileTags: (path) => {
         const f = this.app.vault.getAbstractFileByPath(path);
         if (!(f instanceof TFile)) return [];
@@ -913,9 +975,8 @@ export default class RelatedNotesPlugin extends Plugin {
         if (!(f instanceof TFile)) return Promise.resolve([]);
         return Promise.resolve(this.store.rank(f).slice(0, k).map((r) => r.file.path));
       },
-      // PascalCase concept paths for the note: its taxonomy leaf first, then
-      // its detector proposals' tag paths (ci-deduped). [] while no taxonomy
-      // has been computed; memoized per taxonomy generation.
+      // Evidence-backed concept paths for the note, ci-deduped in proposal
+      // order. [] until the current taxonomy assembly has completed.
       taxonomyCandidates: (path) => this.conceptTagCandidatesFor(path),
       // The note's store-gated neighbour tag votes, mapped 1:1 (the store
       // already returns lowercased {tag, support, voters} rows).
@@ -1013,7 +1074,7 @@ export default class RelatedNotesPlugin extends Plugin {
     try {
       // Carry the concept taxonomy along so the pipeline's two bridge sections
       // render; an empty result (index not loaded) leaves both sections out.
-      insights = this.store.computeInsights(new Set([path]), await this.currentTaxonomy());
+      insights = await this.store.computeInsightsAsync(new Set([path]), await this.currentTaxonomy());
     } catch (e) {
       new Notice(`Vault insights failed: ${(e as Error).message}`);
       return;
@@ -1117,21 +1178,109 @@ export default class RelatedNotesPlugin extends Plugin {
     return L.join("\n");
   }
 
-  private async flushDirty(): Promise<void> {
+  private conceptNamingTextRevision(file: TFile): string {
+    return `${file.stat.mtime}:${file.stat.size}`;
+  }
+
+  private async conceptNamingTextFor(file: TFile): Promise<string> {
+    const revision = this.conceptNamingTextRevision(file);
+    const cached = this.conceptNamingTextCache.get(file.path);
+    if (cached?.revision === revision) return cached.text;
+    const text = stripMarkdown(await this.app.vault.cachedRead(file));
+    this.conceptNamingTextCache.set(file.path, { revision, text });
+    return text;
+  }
+
+  private preserveConceptNamingTextForTagOnlyChange(file: TFile): void {
+    const cached = this.conceptNamingTextCache.get(file.path);
+    if (!cached) return;
+    this.conceptNamingTextCache.set(file.path, {
+      revision: this.conceptNamingTextRevision(file),
+      text: cached.text,
+    });
+  }
+
+  private pruneConceptNamingTextCache(): void {
+    for (const path of this.conceptNamingTextCache.keys()) {
+      if (!this.store.isConceptTagEligible(path)) this.conceptNamingTextCache.delete(path);
+    }
+  }
+
+  private markConceptTagOnlyChanges(proposals: readonly TagRewriteProposal[]): void {
+    const bodyRewritePaths = new Set(
+      proposals
+        .filter((proposal) => proposal.replacesTag !== undefined && proposal.replacesTag.trim() !== "")
+        .map((proposal) => proposal.notePath),
+    );
+    for (const path of bodyRewritePaths) this.conceptTagOnlyDirtyPaths.delete(path);
+    for (const proposal of proposals) {
+      if (!bodyRewritePaths.has(proposal.notePath)) this.conceptTagOnlyDirtyPaths.add(proposal.notePath);
+    }
+  }
+
+  conceptTagRefreshPending(): boolean {
+    return this.conceptGeometryUpdateFlight !== null || this.dirty.size > 0;
+  }
+
+  private flushDirty(): Promise<void> {
     // First-run gate: never embed (which would download the default model) before the
     // user has picked a model. Picking one runs a full build over all notes anyway.
     if (!this.settings.modelChosen) {
       this.dirty.clear();
-      return;
+      return Promise.resolve();
     }
-    if (this.dirty.size === 0) return;
-    const paths = Array.from(this.dirty);
-    this.dirty.clear();
-    for (const path of paths) {
-      const file = this.app.vault.getAbstractFileByPath(path);
-      if (file instanceof TFile) await this.store.updateFile(file);
-    }
-    this.getView()?.requestRender();
+    if (this.isConceptRefreshStopped) return Promise.resolve();
+    if (this.conceptGeometryUpdateFlight) return this.conceptGeometryUpdateFlight;
+    if (this.dirty.size === 0) return Promise.resolve();
+
+    const geometryUpdate = (async () => {
+      let hasUpdated = false;
+      while (!this.isConceptRefreshStopped && this.dirty.size > 0) {
+        const path = this.dirty.values().next().value as string;
+        this.dirty.delete(path);
+        const file = this.app.vault.getAbstractFileByPath(path);
+        if (!(file instanceof TFile)) {
+          this.conceptTagOnlyDirtyPaths.delete(path);
+          continue;
+        }
+        const isTagOnlyChange = this.conceptTagOnlyDirtyPaths.delete(path);
+        if (isTagOnlyChange) this.preserveConceptNamingTextForTagOnlyChange(file);
+        try {
+          await this.store.updateFile(file);
+          hasUpdated = true;
+        } catch (error) {
+          if (this.isConceptRefreshStopped) return;
+          this.dirty.add(path);
+          this.debouncedUpdate(file);
+          throw error;
+        }
+        if (this.app.vault.getAbstractFileByPath(path) !== file) {
+          this.conceptNamingTextCache.delete(path);
+          continue;
+        }
+        if (!isTagOnlyChange) {
+          try {
+            await this.conceptNamingTextFor(file);
+          } catch {
+            this.conceptNamingTextCache.delete(path);
+          }
+        }
+      }
+      if (!hasUpdated || this.isConceptRefreshStopped) return;
+      this.indexEpoch += 1;
+      // Tags participate in embedding geometry, so even a tag-only edit needs one
+      // post-vector taxonomy refresh. Its cleaned naming text remains reusable.
+      this.conceptTaxonomyEpoch += 1;
+      this.invalidateConceptTaxonomy();
+    })();
+    let flight: Promise<void>;
+    flight = geometryUpdate.finally(() => {
+      if (this.conceptGeometryUpdateFlight !== flight) return;
+      this.conceptGeometryUpdateFlight = null;
+      if (!this.isConceptRefreshStopped) this.getView()?.requestRender();
+    });
+    this.conceptGeometryUpdateFlight = flight;
+    return flight;
   }
 
   // --- concept tagging -------------------------------------------------------
@@ -1147,38 +1296,63 @@ export default class RelatedNotesPlugin extends Plugin {
     this.conceptTaxonomy = null;
     this.conceptTaxonomyIndexMtime = null;
     this.conceptTaxonomyNamingKey = null;
-    this.conceptTagCandidates = null;
+    this.invalidateConceptTagProposals();
   }
 
-  // Compute-on-demand over the loaded index: the vault map's note set plus a
-  // one-time body read for the taxonomy's c-TF-IDF corpus. The cache is keyed
-  // by the index generation AND the naming settings, so a rebuild — or a change
-  // to the naming mode, endpoint or model — forces exactly one recompute.
+  private invalidateConceptTagProposals(): void {
+    this.conceptTagCandidates = null;
+    this.tagPanelMemo = null;
+  }
+
+  // Compute on demand over the loaded index. Clean naming text is revision-cached,
+  // so a taxonomy refresh reads only notes whose content revision changed.
   // Public because the caller sits in another file: the panel's tags mode renders
   // this taxonomy (src/view.ts), as applyReviewedProposals is public for its modal.
   async currentTaxonomy(): Promise<TaxonomyResult> {
+    if (this.conceptTagRefreshPending()) return { nodes: [], leafAssignment: new Map() };
+    // Keep the flight even on invalidation: a new epoch must wait for the old
+    // work to settle, then recheck the existing memo keys. Never overlap builds.
+    if (this.taxonomyInFlight) {
+      await this.taxonomyInFlight;
+      return this.currentTaxonomy();
+    }
+    const epoch = this.conceptTaxonomyEpoch;
+    const namingKey = this.tagNamingKey();
+    const flight = this.buildCurrentTaxonomy();
+    this.taxonomyInFlight = flight;
+    let taxonomy: TaxonomyResult;
+    try {
+      taxonomy = await flight;
+    } finally {
+      this.taxonomyInFlight = null;
+    }
+    if (epoch !== this.conceptTaxonomyEpoch || namingKey !== this.tagNamingKey()) return this.currentTaxonomy();
+    return taxonomy;
+  }
+
+  private async buildCurrentTaxonomy(): Promise<TaxonomyResult> {
     if (!this.indexReady()) return { nodes: [], leafAssignment: new Map() };
-    const namingKey = namingCacheKey(
-      this.settings.conceptNamingMode,
-      this.settings.conceptNamingEndpoint,
-      this.settings.conceptNamingModel,
-      this.settings.conceptNamingApiKey !== "",
-    );
+    const namingKey = this.tagNamingKey();
     if (
       this.conceptTaxonomy &&
-      this.conceptTaxonomyIndexMtime === this.indexEpoch &&
+      this.conceptTaxonomyIndexMtime === this.conceptTaxonomyEpoch &&
       this.conceptTaxonomyNamingKey === namingKey
     ) {
       return this.conceptTaxonomy;
     }
-    const notes = this.store.vaultMapInput();
+    const epoch = this.conceptTaxonomyEpoch;
+    const notes = this.store.conceptTaxonomyInput();
     const bodies = new Map<string, string>();
+    const includedPaths = new Set(notes.map((note) => note.path));
+    for (const path of this.conceptNamingTextCache.keys()) {
+      if (!includedPaths.has(path)) this.conceptNamingTextCache.delete(path);
+    }
     await Promise.all(
       notes.map(async (n) => {
         const f = this.app.vault.getAbstractFileByPath(n.path);
         if (!(f instanceof TFile)) return; // deleted mid-read: title alone names its cluster
         try {
-          bodies.set(n.path, stripMarkdown(await this.app.vault.cachedRead(f)));
+          bodies.set(n.path, await this.conceptNamingTextFor(f));
         } catch {
           // unreadable: title alone, same as a deleted note
         }
@@ -1206,25 +1380,126 @@ export default class RelatedNotesPlugin extends Plugin {
     if (outcome.failure !== undefined) new Notice(outcome.failure); // once per failed attempt; the local taxonomy serves on
     // The renamed taxonomy (provider-validated: same membership, order, levels,
     // depth) feeds everything downstream unchanged; replacements stay modal-gated.
+    // Reads/model naming can span an index transition. Stamp the captured epoch,
+    // never the epoch at completion; the next caller will reject an obsolete memo.
+    if (
+      this.conceptTagRefreshPending() ||
+      epoch !== this.conceptTaxonomyEpoch ||
+      namingKey !== this.tagNamingKey()
+    ) return { nodes: [], leafAssignment: new Map() };
     this.conceptTaxonomy = outcome.taxonomy;
-    this.conceptTaxonomyIndexMtime = this.indexEpoch;
+    this.conceptTaxonomyIndexMtime = epoch;
     this.conceptTaxonomyNamingKey = namingKey;
     this.conceptTagCandidates = null; // the detector memo follows the taxonomy
     return outcome.taxonomy;
   }
 
-  // The pipeline's one composition: taxonomy → computeInsights (which already
-  // sequences taxonomy → detectors → neighbour vote into conceptProposals —
-  // the wiring does NOT run the detectors for proposals itself) → confidence
-  // floor → optional per-note filter. Vault-wide compute once per invocation.
+  // Local review ranks one note; explicit vault review drains the concept-only
+  // sweep. Both share the store's membership/detector/vote composition.
   private async assembleTagProposals(file?: TFile): Promise<TagRewriteProposal[]> {
-    if (!this.indexReady()) return [];
-    const taxonomy = await this.currentTaxonomy();
-    const insights = this.store.computeInsights(new Set(), taxonomy);
-    const kept = insights.conceptProposals.filter(
-      (p) => p.confidence >= this.settings.conceptTagMinConfidence,
-    );
-    return file ? kept.filter((p) => p.notePath === file.path) : kept;
+    return file ? this.assembleNoteTagProposals(file) : this.assembleVaultTagProposals();
+  }
+
+  private publishConceptTagCandidates(
+    key: string,
+    proposals: readonly TagRewriteProposal[],
+    notePath?: string,
+  ): void {
+    const byNote = this.conceptTagCandidates?.key === key
+      ? new Map(this.conceptTagCandidates.byNote)
+      : new Map<string, string[]>();
+    if (notePath !== undefined) byNote.delete(notePath);
+    for (const proposal of proposals) {
+      const paths = byNote.get(proposal.notePath);
+      if (!paths) byNote.set(proposal.notePath, [proposal.tagPath]);
+      else if (!paths.some((path) => path.toLowerCase() === proposal.tagPath.toLowerCase())) {
+        paths.push(proposal.tagPath);
+      }
+    }
+    this.conceptTagCandidates = { key, byNote };
+  }
+
+  private async assembleNoteTagProposals(file: TFile): Promise<TagRewriteProposal[]> {
+    for (;;) {
+      if (
+        !this.indexReady() ||
+        this.conceptTagRefreshPending() ||
+        !this.store.isConceptTagEligible(file.path)
+      ) return [];
+      const key = this.tagAssemblyKey();
+      const existing = this.tagNoteAssemblyInFlight.get(file.path);
+      if (existing?.key === key) return existing.promise;
+      const promise = (async () => {
+        const taxonomy = await this.currentTaxonomy();
+        if (this.conceptTagRefreshPending()) return [];
+        const proposals = (await this.store.conceptProposalsForNote(file, taxonomy))
+          .filter((proposal) => proposal.confidence >= this.settings.conceptTagMinConfidence);
+        if (this.conceptTagRefreshPending()) return [];
+        if (key !== this.tagAssemblyKey()) return this.assembleNoteTagProposals(file);
+        this.publishConceptTagCandidates(key, proposals, file.path);
+        return proposals;
+      })();
+      const flight = { key, promise };
+      this.tagNoteAssemblyInFlight.set(file.path, flight);
+      try {
+        return await promise;
+      } finally {
+        if (this.tagNoteAssemblyInFlight.get(file.path) === flight) {
+          this.tagNoteAssemblyInFlight.delete(file.path);
+        }
+      }
+    }
+  }
+
+  private async assembleVaultTagProposals(): Promise<TagRewriteProposal[]> {
+    if (this.conceptTagRefreshPending()) return [];
+    if (this.tagAssemblyInFlight) {
+      return this.tagAssemblyInFlight.promise;
+    }
+    const promise = (async () => {
+      for (;;) {
+        if (!this.indexReady() || this.conceptTagRefreshPending()) return [];
+        const flightKey = this.tagAssemblyKey();
+        const taxonomy = await this.currentTaxonomy();
+        if (this.conceptTagRefreshPending()) return [];
+        const proposals = await this.store.computeConceptProposalsAsync(taxonomy, (completed, total) => {
+          this.tagAssemblyProgress = { completed, total };
+        });
+        if (flightKey !== this.tagAssemblyKey()) continue;
+        const filtered = proposals.filter((proposal) =>
+          proposal.confidence >= this.settings.conceptTagMinConfidence &&
+          this.store.isConceptTagEligible(proposal.notePath),
+        );
+        this.publishConceptTagCandidates(flightKey, filtered);
+        return filtered;
+      }
+    })();
+    const flight = { key: this.tagAssemblyKey(), promise };
+    this.tagAssemblyInFlight = flight;
+    try {
+      return await promise;
+    } finally {
+      if (this.tagAssemblyInFlight === flight) this.tagAssemblyInFlight = null;
+      this.tagAssemblyProgress = null;
+    }
+  }
+
+  private tagNamingKey(): string {
+    return JSON.stringify({
+      naming: namingCacheKey(
+        this.settings.conceptNamingMode,
+        this.settings.conceptNamingEndpoint,
+        this.settings.conceptNamingModel,
+        this.settings.conceptNamingApiKey !== "",
+      ),
+      excluded: this.excludeFoldersKey(),
+      isolatedAreas: this.parseIsolatedAreas().sort(),
+      eligibleNotes: this.store.conceptEligibilityKey(),
+    });
+  }
+
+  private tagAssemblyKey(): string {
+    return `${this.indexEpoch}|${this.conceptEvidenceEpoch}|${this.tagNamingKey()}|${this.settings.conceptTagMinConfidence}`;
   }
 
   // The panel's one data source: the memoized vault-wide assembly in this plugin's
@@ -1233,58 +1508,27 @@ export default class RelatedNotesPlugin extends Plugin {
   async tagPanelDataFor(file: TFile | null): Promise<TagPanelData | null> {
     if (!this.settings.conceptTaggingEnabled) return null;
     if (!this.indexReady()) return { forNote: null, vault: [] }; // same loaded-state gate as the assembly itself
-    const namingKey = namingCacheKey(
-      this.settings.conceptNamingMode,
-      this.settings.conceptNamingEndpoint,
-      this.settings.conceptNamingModel,
-      this.settings.conceptNamingApiKey !== "",
-    );
-    const key = `${this.indexEpoch}|${namingKey}|${this.settings.conceptTagMinConfidence}`;
-    let memo = this.tagPanelMemo;
-    if (!memo || memo.key !== key) {
-      // ONE vault-wide assembly per key — the floor filter stays inside the assembler.
-      const proposals = await this.assembleTagProposals();
-      // One census per memo build (order 0015's rule), distilled to note -> exact tags.
-      const carriedTags = new Map<string, string[]>();
-      for (const tag of this.store.tagInventory().values()) {
-        for (const [notePath, exacts] of tag.exactByNote) {
-          const carried = carriedTags.get(notePath);
-          if (carried) carried.push(...exacts);
-          else carriedTags.set(notePath, [...exacts]);
-        }
-      }
-      memo = { proposals, carriedTags, key };
-      this.tagPanelMemo = memo;
+    if (!file) return { forNote: null, vault: [] };
+    const key = this.tagAssemblyKey();
+    if (!this.tagPanelMemo || this.tagPanelMemo.key !== key || this.tagPanelMemo.notePath !== file.path) {
+      const proposals = await this.assembleTagProposals(file);
+      if (key !== this.tagAssemblyKey()) return this.tagPanelDataFor(file);
+      const carriedTags = new Map([[file.path, this.store.conceptCarriedTags(file.path)]]);
+      this.tagPanelMemo = { proposals, carriedTags, key, notePath: file.path };
     }
+    const memo = this.tagPanelMemo;
     return tagPanelData(file?.path ?? null, memo.proposals, (notePath) => memo.carriedTags.get(notePath) ?? []);
   }
 
-  // Reader-host member: the note's taxonomy leaf, then the tag paths of its
-  // placement/normalization proposals in detector order, ci-deduped keeping
-  // the first (PascalCase) rendering — leaf first. Memoized per generation.
+  // Reader-host member: the same evidence-backed, confidence-filtered paths the
+  // review workflow assembled, ci-deduped in proposal order.
   // Public because the caller sits in another file: the panel's tags mode shows
   // these as the note's suggested tags (src/view.ts).
   conceptTagCandidatesFor(path: string): string[] {
-    if (!this.conceptTaxonomy) return []; // nothing computed yet
-    return this.conceptTagCandidateMemo().get(path) ?? [];
-  }
-
-  private conceptTagCandidateMemo(): Map<string, string[]> {
-    if (this.conceptTagCandidates) return this.conceptTagCandidates;
-    const taxonomy = this.conceptTaxonomy;
-    const memo = new Map<string, string[]>();
-    if (!taxonomy) return memo; // not stored: an empty memo must not outlive the gate
-    const inventory = this.store.tagInventory(); // the store's own census: eligible notes, shared pool, exact forms
-    const add = (notePath: string, tagPath: string): void => {
-      const list = memo.get(notePath);
-      if (!list) memo.set(notePath, [tagPath]);
-      else if (!list.some((t) => t.toLowerCase() === tagPath.toLowerCase())) list.push(tagPath);
-    };
-    for (const [notePath, leaf] of taxonomy.leafAssignment) add(notePath, leaf);
-    for (const p of detectPlacement(taxonomy, inventory)) add(p.notePath, p.tagPath);
-    for (const p of detectNormalization(taxonomy, inventory)) add(p.notePath, p.tagPath);
-    this.conceptTagCandidates = memo;
-    return memo;
+    if (this.conceptTagRefreshPending() || !this.store.isConceptTagEligible(path)) return [];
+    const memo = this.conceptTagCandidates;
+    if (!memo || memo.key !== this.tagAssemblyKey()) return [];
+    return memo.byNote.get(path) ?? [];
   }
 
   // The four commands' one port over live plugin state, built per invocation so
@@ -1302,6 +1546,7 @@ export default class RelatedNotesPlugin extends Plugin {
     const port: TaggingCommandPort = {
       frontmatter,
       ledgerStorage,
+      isNoteEligible: (notePath) => this.store.isConceptTagEligible(notePath),
       now: () => Date.now(),
       ledgerRetentionDays: () => 0, // keep the whole journal: the vault has no git to fall back on
       taxonomyPreviewLines: async () => renderTaxonomyPreview(await this.currentTaxonomy()),
@@ -1333,10 +1578,13 @@ export default class RelatedNotesPlugin extends Plugin {
           return null; // unreadable reads veto (drift), never feed a mis-cut
         }
       },
-      writeNoteContent: async (notePath, text) => {
+      writeNoteContent: async (notePath, text, canMutate) => {
         const file = asFile(notePath);
         if (!file) throw new Error(`note-unavailable: ${notePath}`); // the pure layer routes this to a skip
-        await vault.process(file, () => text); // whole-content replacement through the vault's write channel
+        await vault.process(file, () => {
+          if (canMutate?.() === false) throw new Error(`note-ineligible: ${notePath}`);
+          return text;
+        }); // whole-content replacement through the vault's write channel
       },
       inlineTagSpans: async (notePath) => {
         const file = asFile(notePath);
@@ -1354,6 +1602,7 @@ export default class RelatedNotesPlugin extends Plugin {
   // (order 0011 invariant 1), and one Notice surfaces the returned text.
   private async runTaggingCommand(
     run: (port: TaggingCommandPort) => Promise<string>,
+    mayRewriteBody = false,
   ): Promise<void> {
     if (!this.settings.conceptTaggingEnabled) {
       new Notice("Concept tagging is disabled in settings.");
@@ -1363,6 +1612,7 @@ export default class RelatedNotesPlugin extends Plugin {
     // every await in it can write note frontmatter (apply, revert). try/finally
     // so a throw still releases the window.
     this.taggingWritesInFlight += 1;
+    if (mayRewriteBody) this.conceptTagOnlyDirtyPaths.clear();
     try {
       new Notice(await run(this.taggingCommandPort()));
     } catch (e) {
@@ -1384,15 +1634,57 @@ export default class RelatedNotesPlugin extends Plugin {
       new Notice("Concept tagging is disabled in settings.");
       return;
     }
+    if (this.conceptTagRefreshPending()) {
+      new Notice("Concept tags: waiting for recent note edits to finish indexing.");
+      return;
+    }
     try {
-      const proposals = await this.assembleTagProposals(file);
+      const proposals = (await this.assembleTagProposals(file))
+        .filter((proposal) => this.store.isConceptTagEligible(proposal.notePath));
       if (proposals.length === 0) {
         new Notice("Concept tags: no proposals to review.");
         return;
       }
-      new ConceptTagReviewModal(this, proposals, this.conceptInlineAccess()).open();
+      this.openConceptTagReview(proposals);
     } catch (e) {
       console.warn("[related-notes] concept tagging review failed", e);
+      new Notice("Related notes: concept tagging failed. See the console.");
+    }
+  }
+
+  private openConceptTagReview(proposals: TagRewriteProposal[]): void {
+    new ConceptTagReviewModal(this, proposals, this.conceptInlineAccess()).open();
+  }
+
+  async applyConceptTagSuggestion(file: TFile, tagPath: string): Promise<void> {
+    if (!this.settings.conceptTaggingEnabled) {
+      new Notice("Concept tagging is disabled in settings.");
+      return;
+    }
+    if (this.conceptTagRefreshPending()) {
+      new Notice("Concept tags: waiting for recent note edits to finish indexing.");
+      return;
+    }
+    try {
+      const selected = (await this.assembleTagProposals(file)).filter((proposal) =>
+        proposal.notePath === file.path &&
+        proposal.tagPath.toLowerCase() === tagPath.toLowerCase() &&
+        this.store.isConceptTagEligible(proposal.notePath),
+      );
+      if (selected.length === 0) {
+        new Notice("Concept tags: this suggestion is no longer available.");
+        return;
+      }
+      if (filterAdditiveProposals(selected).length !== selected.length) {
+        this.openConceptTagReview(selected);
+        return;
+      }
+      await this.runTaggingCommand((port) => applySelectedProposals(port, selected));
+      this.markConceptTagOnlyChanges(selected);
+      this.conceptTagCandidates = null;
+      this.tagPanelMemo = null;
+    } catch (e) {
+      console.warn("[related-notes] concept tag suggestion failed", e);
       new Notice("Related notes: concept tagging failed. See the console.");
     }
   }
@@ -1403,7 +1695,27 @@ export default class RelatedNotesPlugin extends Plugin {
   // apply and one Notice surfaces the result. Applying the selection is the
   // review: what lands is journaled, and the next assembly no longer proposes it.
   async applyReviewedProposals(selected: TagRewriteProposal[]): Promise<void> {
-    await this.runTaggingCommand((port) => applySelectedProposals(port, selected));
+    const eligible = selected.filter((proposal) => this.store.isConceptTagEligible(proposal.notePath));
+    const mayRewriteBody = eligible.some((proposal) =>
+      proposal.replacesTag !== undefined && proposal.replacesTag.trim() !== ""
+    );
+    await this.runTaggingCommand((port) => applySelectedProposals(port, eligible), mayRewriteBody);
+    this.markConceptTagOnlyChanges(eligible);
+  }
+
+  async applyReaderSuggestedTag(file: TFile, tag: string): Promise<boolean> {
+    if (!this.settings.readerSuggestTags || !this.store.isConceptTagEligible(file.path)) return false;
+    let applied = false;
+    await this.app.fileManager.processFrontMatter(file, (frontmatter: Record<string, unknown>) => {
+      if (!this.store.isConceptTagEligible(file.path)) return;
+      const current = frontmatter.tags;
+      const tags = Array.isArray(current) ? current : typeof current === "string" && current.length > 0 ? [current] : [];
+      if (!tags.map(String).some((existing) => existing.toLowerCase() === tag.toLowerCase())) tags.push(tag);
+      frontmatter.tags = tags;
+      applied = true;
+    });
+    if (applied) this.conceptTagOnlyDirtyPaths.add(file.path);
+    return applied;
   }
 
   // Idle auto-apply for the changed note: its additive-only list (order 0011's
@@ -1418,11 +1730,14 @@ export default class RelatedNotesPlugin extends Plugin {
     if (!this.indexReady()) return;
     const file = this.app.vault.getAbstractFileByPath(path);
     if (!(file instanceof TFile)) return; // deleted during the idle wait
+    if (!this.store.isConceptTagEligible(path)) return;
     const idlePort = this.taggingCommandPort(false); // idle path: port built with the inline channel excluded
     this.taggingWritesInFlight += 1; // self-write suppression, as in runTaggingCommand
     try {
-      const proposals = filterAdditiveProposals(await this.assembleTagProposals(file));
+      const proposals = filterAdditiveProposals(await this.assembleTagProposals(file))
+        .filter((proposal) => this.store.isConceptTagEligible(proposal.notePath));
       await applySelectedProposals(idlePort, proposals);
+      this.markConceptTagOnlyChanges(proposals);
     } catch (e) {
       console.warn("[related-notes] concept-tag auto-apply failed", e);
     } finally {
@@ -1737,10 +2052,14 @@ export default class RelatedNotesPlugin extends Plugin {
   }
 
   private parseExcludeFolders(): string[] {
-    return this.settings.excludeFolders
+    return [...new Set(this.settings.excludeFolders
       .split(/[\n,]/)
-      .map((s) => s.trim().replace(/\/+$/, ""))
-      .filter((s) => s.length > 0);
+      .map((s) => normalizePath(s.trim()).replace(/^\/+|\/+$/g, ""))
+      .filter((s) => s.length > 0))];
+  }
+
+  private excludeFoldersKey(): string {
+    return this.parseExcludeFolders().sort().join("\n");
   }
 
   private parseLinkExcludeFolders(): string[] {
@@ -1759,6 +2078,9 @@ export default class RelatedNotesPlugin extends Plugin {
   async saveSettings(): Promise<void> {
     await this.saveData(this.settings);
     this.store.updateOptions(this.storeOptions());
+    if (this.conceptTaxonomyNamingKey !== null && this.conceptTaxonomyNamingKey !== this.tagNamingKey()) {
+      this.invalidateConceptTaxonomy();
+    }
     // Idle-unload is a live knob: apply it without any engine rebuild. (The swap
     // path below re-applies it to the replacement engine.)
     this.applyEngineIdlePolicy();
@@ -1796,6 +2118,7 @@ export default class RelatedNotesPlugin extends Plugin {
     if ((modelChanged || deviceChanged || indexSpeedChanged) && !this.swapping) {
       this.swapping = true;
       try {
+        this.conceptNamingTextCache.clear();
         // Dispose the engine being REPLACED. Without this every model/device/
         // speed change orphaned the old ONNX session inside the wasm heap —
         // which can never shrink — so repeated settings changes ratcheted the
@@ -1829,6 +2152,7 @@ export default class RelatedNotesPlugin extends Plugin {
     } else if (shapeChanged && !this.swapping) {
       this.swapping = true;
       try {
+        this.conceptNamingTextCache.clear();
         this.appliedChunking = this.settings.chunking;
         this.appliedMaxChunks = this.settings.maxChunks;
         this.appliedShowSummary = this.settings.showSummary;
@@ -1839,6 +2163,15 @@ export default class RelatedNotesPlugin extends Plugin {
         await this.store.build(undefined, true);
       } finally {
         this.swapping = false;
+      }
+    }
+    const scopeToReconcile = this.excludeFoldersKey();
+    if (this.appliedExcludeFoldersKey !== scopeToReconcile) {
+      this.invalidateConceptTaxonomy();
+      await this.store.reconcileFiles();
+      this.pruneConceptNamingTextCache();
+      if (scopeToReconcile === this.excludeFoldersKey() && this.store.getProgress().status === "ready") {
+        this.appliedExcludeFoldersKey = scopeToReconcile;
       }
     }
     this.getView()?.requestRender();

@@ -20,6 +20,7 @@ export interface ReaderHost {
   vaultRead(file: TFile): Promise<string>;
   markdownFiles(): TFile[];
   fileByPath(path: string): TFile | null;
+  conceptTagEligible(path: string): boolean;
   fileTags(path: string): string[]; // lowercased frontmatter+inline tags
   neighborPaths(path: string, k: number): Promise<string[]>;
   taxonomyCandidates(path: string): string[]; // PascalCase tag paths for the note; [] when no taxonomy exists
@@ -44,7 +45,7 @@ interface Artifact {
   model: string;
   tags?: string[]; // verified suggestions (may be empty = none fit)
   tagsH?: string; // hash of (h + candidate set) the tags were computed for
-  cand?: string[]; // the exact offered list the tags were computed for (serves only while it covers the taxonomy)
+  cand?: string[]; // the exact offered list the tags were computed for
   dismissed?: string[];
 }
 
@@ -311,13 +312,12 @@ export class ReaderService {
   // one composer — store votes (df-windowed there) plus ungated taxonomy tag
   // paths; the reader only picks from that closed set. A cached set serves
   // only while its artifact is fresh AND its recorded offered list still
-  // covers every current taxonomy candidate (candidate coverage: a new path
-  // can never be suppressed by a stale cache); otherwise recompute in the
+  // exactly matches the current composed candidate list; otherwise recompute in the
   // background, re-rendering when fresh tags land.
   suggestedTags(path: string): string[] {
     const f = this.host.fileByPath(path);
     const a = this.artifacts.get(path);
-    if (!f || !this.engine || this.status.state !== "ready") return [];
+    if (!f || !this.host.conceptTagEligible(path) || !this.engine || this.status.state !== "ready") return [];
     if (a && a.h === this.srcHash(f) && this.candidatesCovered(path, a)) {
       return (a.tags ?? []).filter((t) => !(a.dismissed ?? []).includes(t));
     }
@@ -325,19 +325,24 @@ export class ReaderService {
     return [];
   }
 
-  // Candidate coverage: the cached offered list must contain every current
-  // taxonomy candidate (ci). An artifact with no recorded list was written
-  // before the composer existed — uncovered, so it recomputes.
+  // The cached offered list must exactly match the current composed list. This
+  // catches removals as well as additions; an old superset must not serve tags.
   private candidatesCovered(path: string, a: Artifact): boolean {
     if (!a.cand) return false;
-    const offered = new Set(a.cand.map((c) => c.toLowerCase()));
-    return this.host.taxonomyCandidates(path).every((p) => offered.has(p.toLowerCase()));
+    const current = composeTagCandidates(
+      this.host.fileTags(path),
+      this.host.tagNeighbours(path),
+      this.host.taxonomyCandidates(path),
+    );
+    return a.cand.length === current.length && a.cand.every((candidate, index) =>
+      candidate.toLowerCase() === current[index].toLowerCase(),
+    );
   }
 
   private tagsInFlight = new Set<string>();
 
   private async computeTags(file: TFile): Promise<void> {
-    if (this.tagsInFlight.has(file.path) || this.busy) return;
+    if (!this.host.conceptTagEligible(file.path) || this.tagsInFlight.has(file.path) || this.busy) return;
     // Invisibility rule: never spin the model up because the user LOOKED at a
     // note. Compute chips only when the engine is already warm, or the user
     // has gone idle anyway.
@@ -360,6 +365,7 @@ export class ReaderService {
         const picked = await this.runTask(pickTagsTask(n, candidates));
         tags = Array.isArray(picked) ? picked : [];
       }
+      if (!this.host.conceptTagEligible(file.path)) return;
       const prev = this.artifacts.get(file.path);
       const carry = prev?.h === h ? prev : { dismissed: prev?.dismissed };
       this.artifacts.set(file.path, { model: this.rung().id, ...carry, h, tags, tagsH: key, cand: candidates });

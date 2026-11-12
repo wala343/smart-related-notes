@@ -7,7 +7,7 @@ import assert from "node:assert/strict";
 // @ts-expect-error
 import { joinSegments } from "./proposal.ts";
 // @ts-expect-error
-import { buildTaxonomy, type TaxonomyInputNote, type TextProvider } from "./taxonomy.ts";
+import { buildConceptMembershipIndex, buildTaxonomy, type TaxonomyInputNote, type TextProvider } from "./taxonomy.ts";
 
 // Same deterministic PRNG as the module (kept under the same name run-wide).
 function mulberry32(seed: number): () => number {
@@ -109,6 +109,55 @@ function shuffle<T>(arr: T[], rng: () => number): T[] {
 
 const MAIN_OPTS = { minSubClusterSize: 4 }; // 8-note groups: k=3 tops and 2 children per group only fit minSubClusterSize <= 4
 
+void test("evidence membership gives a bridge two concepts, a clear note one, and an outlier none", () => {
+  const unit = (x: number, y: number, z = 0): Float32Array => {
+    const length = Math.hypot(x, y, z) || 1;
+    return new Float32Array([x / length, y / length, z / length]);
+  };
+  const notes: TaxonomyInputNote[] = [
+    ...[1, 2, 3].map((n) => ({ path: `alpha-${n}.md`, title: "Alpha", vec: unit(1, 0) })),
+    ...[1, 2, 3].map((n) => ({ path: `beta-${n}.md`, title: "Beta", vec: unit(0, 1) })),
+    { path: "bridge.md", title: "Bridge", vec: unit(1, 1) },
+    { path: "outlier.md", title: "Outlier", vec: unit(0, 0, 1) },
+  ];
+  const taxonomy = {
+    nodes: [
+      { level: 1, segments: ["Alpha"], notePaths: [] },
+      { level: 2, segments: ["Alpha", "Specific"], notePaths: ["alpha-1.md", "alpha-2.md", "alpha-3.md", "bridge.md", "outlier.md"] },
+      { level: 1, segments: ["Beta"], notePaths: ["beta-1.md", "beta-2.md", "beta-3.md"] },
+    ],
+    leafAssignment: new Map([
+      ...[1, 2, 3].map((n) => [`alpha-${n}.md`, "Alpha/Specific"] as const),
+      ["bridge.md", "Alpha/Specific"] as const,
+      ["outlier.md", "Alpha/Specific"] as const,
+      ...[1, 2, 3].map((n) => [`beta-${n}.md`, "Beta"] as const),
+    ]),
+  };
+  const assignments = (input: TaxonomyInputNote[], path: string): string[] =>
+    buildConceptMembershipIndex(taxonomy, input).membershipsFor(path).map((row) => row.tagPath);
+
+  assert.deepEqual(assignments(notes, "bridge.md"), ["Alpha/Specific", "Beta"]);
+  assert.deepEqual(assignments(notes, "alpha-1.md"), ["Alpha/Specific"]);
+  assert.deepEqual(assignments(notes, "outlier.md"), []);
+  assert.deepEqual(assignments(shuffle(notes, mulberry32(123)), "bridge.md"), ["Alpha/Specific", "Beta"]);
+});
+
+void test("concept names ignore inline and multiline display math while preserving prose", () => {
+  const fx = hierarchicalFixture();
+  // A single class makes this sensitive to math leakage despite the sibling vocabulary filter.
+  const opts = { ...MAIN_OPTS, minSubClusterSize: 100 };
+  const expected = buildTaxonomy(fx.notes, fx.textOf, opts);
+  for (const math of [String.raw`$\vec{\gamma}$`, "$$\n" + String.raw`\vec{\gamma}` + "\n$$"]) {
+    const noise = math.repeat(100);
+    assert.deepEqual(buildTaxonomy(
+      fx.notes.map((note) => ({ ...note, title: `${note.title}${noise}` })),
+      (path) => `${noise}${fx.textOf(path)}${noise}`,
+      opts,
+    ), expected);
+  }
+  assert.deepEqual(buildTaxonomy(fx.notes, (path) => String.raw`\$` + fx.textOf(path) + String.raw`\$`, opts), expected);
+});
+
 // void: node:test registration promises are deliberately un-awaited — the runner schedules them, nothing to handle here.
 void test("three topic groups become three PascalCase top-level nodes with real children", () => {
   const fx = hierarchicalFixture();
@@ -116,10 +165,10 @@ void test("three topic groups become three PascalCase top-level nodes with real 
 
   const paths = res.nodes.map((n) => joinSegments(n.segments));
   assert.deepEqual(paths, [
-    "NeuralGradient", "NeuralGradient/BackpropNeural", "NeuralGradient/GradientNeural",
-    "PastaBasil", "PastaBasil/BasilPasta", "PastaBasil/ParmesanPasta",
-    "QuantumTunneling", "QuantumTunneling/EntangleQuantum", "QuantumTunneling/TunnelingQuantum",
-  ]); // depth-first, siblings in segment order, group words + dominant sub-terms
+    "NeuralGradient", "NeuralGradient/BackpropLoss", "NeuralGradient/GradientWeight",
+    "PastaBasil", "PastaBasil/BasilGarlic", "PastaBasil/ParmesanFennel",
+    "QuantumTunneling", "QuantumTunneling/EntangleQubit", "QuantumTunneling/TunnelingBarrier",
+  ]); // depth-first, siblings in segment order, children exclude vocabulary shared by all siblings
 
   for (const n of res.nodes) {
     assert.equal(n.level, n.segments.length);
@@ -180,12 +229,58 @@ void test("short and empty inputs return the empty result", () => {
   assert.deepEqual(buildTaxonomy(fx.notes.slice(0, 2), fx.textOf, MAIN_OPTS), empty);
 });
 
-void test("an empty-string text provider still names nodes from titles", () => {
+void test("a tokenless corpus abstains instead of inventing a Group concept", () => {
+  const notes = [0, 1, 2].map((index) => ({
+    path: `${index}.md`,
+    title: "note",
+    vec: new Float32Array([index === 0 ? 1 : 0, index === 1 ? 1 : 0, index === 2 ? 1 : 0]),
+  }));
+  assert.deepEqual(buildTaxonomy(notes, () => ""), { nodes: [], leafAssignment: new Map() });
+});
+
+void test("title-only leaves stay at named parents instead of Group fallback children", () => {
   const fx = hierarchicalFixture();
   const noBodies: TextProvider = () => "";
   const a = buildTaxonomy(fx.notes, noBodies, MAIN_OPTS);
   const b = buildTaxonomy(shuffle(fx.notes, mulberry32(5)), noBodies, MAIN_OPTS);
-  assert.equal(a.nodes.filter((n) => n.level === 1).length, 3);
+  assert.deepEqual(a.nodes.map((n) => joinSegments(n.segments)), ["Neural", "Pasta", "Quantum"]);
+  assert.ok(a.nodes.every((n) => n.segments.every((s) => !/^Group\d+$/.test(s))));
+  for (const note of fx.notes) {
+    assert.equal(a.leafAssignment.get(note.path), note.title.split(" ")[0]);
+  }
   assert.equal(a.leafAssignment.size, fx.notes.length);
   assert.deepEqual(b, a);
+});
+
+void test("a whole-vault node still names from term frequency when there are no siblings", () => {
+  const fx = hierarchicalFixture();
+  const res = buildTaxonomy(fx.notes, () => "vector vector vector calculus", { minSubClusterSize: 25 });
+  assert.deepEqual(res.nodes.map((n) => n.segments), [["VectorCalculus"]]);
+  assert.equal(res.leafAssignment.size, fx.notes.length);
+});
+
+void test("one nameable child cannot satisfy the two-child descent gate", () => {
+  const fx = hierarchicalFixture();
+  const textOf: TextProvider = (path) => path.includes("1-") ? "distinctive" : "";
+  const res = buildTaxonomy(fx.notes, textOf, MAIN_OPTS);
+  assert.deepEqual(res.nodes.map((n) => joinSegments(n.segments)), ["Neural", "Pasta", "Quantum"]);
+  for (const note of fx.notes) {
+    assert.equal(res.leafAssignment.get(note.path), note.title.split(" ")[0]);
+  }
+});
+
+void test("unnameable root candidates retain their notes at a named whole-vault parent", () => {
+  const fx = hierarchicalFixture();
+  const notes = fx.notes.map((note) => ({ ...note, title: "note" }));
+  const textOf: TextProvider = (path) => path.includes("/q") ? "shared" :
+    path.includes("/n") ? "shared neural" : "shared pasta";
+  const res = buildTaxonomy(notes, textOf, MAIN_OPTS);
+  assert.equal(res.leafAssignment.size, notes.length);
+  assert.ok(res.nodes.every((n) => n.segments.every((s) => !/^Group\d+$/.test(s))));
+  const parent = res.nodes.find((n) => n.level === 1);
+  assert.ok(parent);
+  for (const note of notes.filter((n) => n.path.includes("/q"))) {
+    assert.equal(res.leafAssignment.get(note.path), joinSegments(parent.segments));
+  }
+  assert.deepEqual(buildTaxonomy(shuffle(notes, mulberry32(5)), textOf, MAIN_OPTS), res);
 });

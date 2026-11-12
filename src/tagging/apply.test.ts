@@ -71,6 +71,21 @@ void test("appends to an existing block list, keeping order and exact forms", as
   assert.equal(result.mutatedNoteCount, 1);
 });
 
+void test("multiple supported concepts append without removing existing user tags", async () => {
+  const fixture = memoryPort({ "notes/bridge.md": ["UserChosen"] });
+  const result = await applyTagProposals([
+    proposal("notes/bridge.md", "Alpha"),
+    proposal("notes/bridge.md", "Beta"),
+  ], fixture.port);
+  assert.deepEqual(fixture.store.get("notes/bridge.md"), ["UserChosen", "Alpha", "Beta"]);
+  assert.deepEqual(result.notes[0].appliedProposals.map((row) => row.tagPath), ["Alpha", "Beta"]);
+
+  const abstained = memoryPort({ "notes/outlier.md": ["KeepMe"] });
+  await applyTagProposals([], abstained.port);
+  assert.deepEqual(abstained.store.get("notes/outlier.md"), ["KeepMe"]);
+  assert.equal(abstained.writeLog.length, 0);
+});
+
 void test("the empty-form note (tags: [] present) appends like any other", async () => {
   const { port, writeLog } = memoryPort({ "notes/empty.md": [] });
   const result = await applyTagProposals([proposal("notes/empty.md", "Topic")], port);

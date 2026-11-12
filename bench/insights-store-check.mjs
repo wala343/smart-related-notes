@@ -84,6 +84,12 @@ function neg(v) {
   return n;
 }
 
+function withCorpusBias(v) {
+  const components = Array.from(v);
+  components[5] += 1;
+  return unit(...components);
+}
+
 // --- fake vault + deterministic engine ----------------------------------------
 
 // Long body: > CONFIDENT_BODY_CHARS (220) body chars -> contentConfidence 1.0.
@@ -434,6 +440,43 @@ function taxonomyV() {
   };
 }
 
+// VAULT M — evidence membership over the real store workflow. Positive notes are
+// paired around a shared axis-5 corpus bias; production centering removes that
+// nonzero centroid, and only the positive side is in the taxonomy partition.
+// The bridge independently matches Alpha and Beta,
+// while the orthogonal outlier remains assigned for clustering but gets no tag.
+function vaultM() {
+  const out = [];
+  const addPair = (word, path, vec) => {
+    out.push(
+      note({ word, path, vec: withCorpusBias(vec) }),
+      note({ word: `anti${word}`, path: `anti/anti${word}.md`, vec: withCorpusBias(neg(vec)) }),
+    );
+  };
+  for (let i = 1; i <= 3; i++) addPair(`alpha${i}`, `m/alpha${i}.md`, unit(1, 0, 0, 0, 0, 0));
+  for (let i = 1; i <= 3; i++) addPair(`beta${i}`, `m/beta${i}.md`, unit(0, 1, 0, 0, 0, 0));
+  addPair("bridge", "m/bridge.md", unit(1, 1, 0, 0, 0, 0));
+  addPair("outlier", "m/outlier.md", unit(0, 0, 1, 0, 0, 0));
+  addPair("template", "Templates/template.md", unit(1, 0, 0, 0, 0, 0));
+  addPair("blocked", "Excluded/blocked.md", unit(1, 0, 0, 0, 0, 0));
+  return out;
+}
+
+function taxonomyM() {
+  const alpha = ["m/alpha1.md", "m/alpha2.md", "m/alpha3.md", "m/bridge.md", "m/outlier.md", "Templates/template.md", "Excluded/blocked.md"];
+  const beta = ["m/beta1.md", "m/beta2.md", "m/beta3.md"];
+  return {
+    nodes: [
+      { level: 1, segments: ["Alpha"], notePaths: alpha },
+      { level: 1, segments: ["Beta"], notePaths: beta },
+    ],
+    leafAssignment: new Map([
+      ...alpha.map(path => [path, "Alpha"]),
+      ...beta.map(path => [path, "Beta"]),
+    ]),
+  };
+}
+
 // VAULT Y — parity smoke. yaa links ybb, so every other note is an orphan; ycc's top rank
 // must surface as `closest` (yaa, 8 deg apart) and ypz's as ybb. Scrambled mtimes pin the
 // stale ordering. The ym* twins keep the corpus exactly isotropic and cluster at ~180 deg,
@@ -476,6 +519,7 @@ const dStore = await makeStore(vaultD());
 const tpStore = await makeStore(vaultTP(), {}, { centroid: 0 });
 const xStore = await makeStore(vaultX());
 const vStore = await makeStore(vaultV());
+const mStore = await makeStore(vaultM(), {}, { centroid: 5 });
 const yStore = await makeStore(vaultY(), { "y/yaa.md": { "y/ybb.md": 1 } });
 
 // --- helpers ------------------------------------------------------------------
@@ -591,22 +635,13 @@ test("template exclusion: no template-shaped note is half of any pair row", () =
 // SUITE: conceptProposals / taxonomyPreview (order 0015)
 // =============================================================================
 
-test("conceptProposals + taxonomyPreview from a synthetic TaxonomyResult literal", () => {
+test("a cluster partition alone does not force concept proposals", () => {
   const ins = xStore.computeInsights(new Set(), taxonomyX());
   const proposals = (ins.conceptProposals ?? []).map(({ kind, notePath, tagPath, confidence, evidence }) => ({
     kind, notePath, tagPath, confidence, evidence,
   }));
-  // One proposal per leafAssignment entry, sorted by note path, pinned evidence form.
-  assert.deepEqual(proposals, [
-    {
-      kind: "taxonomy", notePath: "x/n1.md", tagPath: "Goa/Character", confidence: 1,
-      evidence: "assigned to node Goa/Character (2 notes, level 2)",
-    },
-    {
-      kind: "taxonomy", notePath: "x/n2.md", tagPath: "Goa/Character", confidence: 1,
-      evidence: "assigned to node Goa/Character (2 notes, level 2)",
-    },
-  ]);
+  // Two antipodal notes share a leaf but provide no positive semantic evidence.
+  assert.deepEqual(proposals, []);
   // The preview is order-0003's lines carried VERBATIM.
   assert.deepEqual(ins.taxonomyPreview, PREVIEW_X);
   // No taxonomy passed -> empty preview (and no taxonomy-kind proposals).
@@ -619,7 +654,7 @@ test("conceptProposals + taxonomyPreview from a synthetic TaxonomyResult literal
 // SUITE: propagation proposals (order 0016)
 // =============================================================================
 
-test("propagation: exact receipts across taxonomy and propagation kinds (3 proposals)", () => {
+test("propagation: sparse taxonomy membership abstains without suppressing neighbour evidence", () => {
   const ins = vStore.computeInsights(new Set(), taxonomyV());
   const rows = ins.suggestedTags;
   assert.equal(rows.length, 2, `fixture premise: vpf and vpo carry exactly two rows: ${JSON.stringify(rows)}`);
@@ -634,15 +669,8 @@ test("propagation: exact receipts across taxonomy and propagation kinds (3 propo
   const props = ins.conceptProposals ?? [];
   // Ordering contract: taxonomy proposals first, then (fixture-silent) placement/
   // normalization, then propagation mirroring the returned suggestedTags order.
-  assert.equal(props.length, 3, `exactly three proposals expected: ${JSON.stringify(props)}`);
-  const [tax, ...prop] = props;
-  assert.deepEqual(
-    { kind: tax.kind, notePath: tax.notePath, tagPath: tax.tagPath, confidence: tax.confidence, evidence: tax.evidence },
-    {
-      kind: "taxonomy", notePath: "v/vpleaf.md", tagPath: "Goa/Location", confidence: 1,
-      evidence: "assigned to node Goa/Location (1 notes, level 2)",
-    }
-  );
+  assert.equal(props.length, 2, `exactly two proposals expected: ${JSON.stringify(props)}`);
+  const prop = props;
   assert.deepEqual(
     prop.map((p) => ({
       kind: p.kind, notePath: p.notePath, tagPath: p.tagPath, confidence: p.confidence,
@@ -657,6 +685,86 @@ test("propagation: exact receipts across taxonomy and propagation kinds (3 propo
     }))
   );
   assert.equal(props.every((p) => !("replacesTag" in p)), true, "replacesTag is NEVER set");
+});
+
+test("note-local concept proposals match full review and rank no unrelated notes", async () => {
+  const notes = [];
+  const positivePaths = [];
+  for (let index = 0; index < 6; index++) {
+    const path = `local/topic${index}.md`;
+    positivePaths.push(path);
+    notes.push(note({
+      word: `topic${index}`,
+      path,
+      vec: unit(1, 0, 0, 0, 0, 0),
+      tags: index === 0 ? ["#character", "#goa/character"] : ["#Topic/Shared"],
+    }));
+    notes.push(note({
+      word: `antiTopic${index}`,
+      path: `anti/antiTopic${index}.md`,
+      vec: unit(-1, 0, 0, 0, 0, 0),
+    }));
+  }
+  const store = await makeStore(notes);
+  const taxonomy = {
+    nodes: [
+      { level: 1, segments: ["Goa"], notePaths: positivePaths },
+      { level: 2, segments: ["Goa", "Character"], notePaths: positivePaths },
+    ],
+    leafAssignment: new Map(positivePaths.map(path => [path, "Goa/Character"])),
+  };
+  const target = fileAt(store, positivePaths[0]);
+  const rankedPaths = [];
+  const originalRank = store.rank.bind(store);
+  store.rank = file => {
+    rankedPaths.push(file.path);
+    return originalRank(file);
+  };
+  const local = await store.conceptProposalsForNote(target, taxonomy);
+  assert.deepEqual(rankedPaths, [target.path], "local review ranks only its target note");
+  assert.deepEqual(new Set(local.map(proposal => proposal.kind)), new Set(["taxonomy", "placement", "normalization", "propagation"]));
+
+  rankedPaths.length = 0;
+  const full = await store.computeConceptProposalsAsync(taxonomy);
+  assert.deepEqual(full.filter(proposal => proposal.notePath === target.path), local);
+  assert.equal(new Set(rankedPaths).size, notes.length, "full review ranks each eligible note once");
+  const sharedKey = store.conceptEligibilityKey();
+  store.updateOptions({ ...OPTIONS, isolatedAreas: ["goa"] });
+  assert.equal(store.isConceptTagEligible(target.path), false);
+  assert.notEqual(store.conceptEligibilityKey(), sharedKey, "isolated-area membership invalidates scope in O(1)");
+  store.updateOptions(OPTIONS);
+  assert.equal(store.isConceptTagEligible(target.path), true);
+  const restoredKey = store.conceptEligibilityKey();
+  store.removeFile("anti/antiTopic5.md");
+  assert.notEqual(store.conceptEligibilityKey(), restoredKey, "deletion invalidates concept scope");
+  store.close();
+});
+
+test("workflow membership supports two, one, or zero concepts and obeys folder exclusions", () => {
+  mStore.updateOptions({ ...OPTIONS, excludeFolders: ["Excluded/"] });
+  assert.equal(mStore.isExcluded("Excluded/blocked.md"), true);
+  assert.equal(mStore.isExcluded("ExcludedSibling/blocked.md"), false);
+  const first = mStore.computeInsights(new Set(), taxonomyM()).conceptProposals
+    .filter(proposal => proposal.kind === "taxonomy");
+  const tagsFor = (path, rows = first) => rows.filter(row => row.notePath === path).map(row => row.tagPath);
+  assert.deepEqual(tagsFor("m/bridge.md"), ["Alpha", "Beta"]);
+  assert.deepEqual(tagsFor("m/alpha1.md"), ["Alpha"]);
+  assert.deepEqual(tagsFor("m/outlier.md"), []);
+  assert.deepEqual(tagsFor("Templates/template.md"), []);
+  assert.deepEqual(tagsFor("Excluded/blocked.md"), []);
+  assert.deepEqual(
+    mStore.computeInsights(new Set(), taxonomyM()).conceptProposals.filter(proposal => proposal.kind === "taxonomy"),
+    first,
+    "the complete proposal order and evidence are deterministic",
+  );
+
+  // Link-only exclusions are not part of IndexStore's general blacklist, while
+  // removing the real exclusion restores the already-indexed note immediately.
+  mStore.updateOptions({ ...OPTIONS, excludeFolders: [] });
+  const restored = mStore.computeInsights(new Set(), taxonomyM()).conceptProposals
+    .filter(proposal => proposal.kind === "taxonomy");
+  assert.deepEqual(tagsFor("Excluded/blocked.md", restored), ["Alpha"]);
+  mStore.updateOptions({ ...OPTIONS, excludeFolders: ["Excluded"] });
 });
 
 // =============================================================================

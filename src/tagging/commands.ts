@@ -57,6 +57,7 @@ function runSerialized<T>(operation: () => Promise<T>): Promise<T> {
 export interface TaggingCommandPort {
   frontmatter: ApplyFrontmatterPort;
   ledgerStorage: LedgerStoragePort;
+  isNoteEligible?(notePath: string): boolean; // checked again inside the serialized mutation boundary
   now(): number;                          // milliseconds; the caller injects Date.now()
   ledgerRetentionDays(): number;          // 0 keeps the whole journal (the default)
   taxonomyPreviewLines(): Promise<string[]>; // the taxonomy area's renderTaxonomyPreview output
@@ -78,14 +79,24 @@ function appliedNotice(result: ApplyResult): string {
 // (Round-1 per-replacement plans erased each other on whole-body commit; one
 // batch per note makes every rewrite simultaneous and the journal truthful.)
 function buildSideChannels(port: TaggingCommandPort): ApplySideChannels {
+  const isEligible = (notePath: string): boolean => port.isNoteEligible?.(notePath) ?? true;
   const channels: ApplySideChannels = {
     journalNoteWrite: async (note) => {
+      if (!isEligible(note.notePath)) throw new Error(`note-ineligible: ${note.notePath}`);
       // Allocate this apply invocation's batch ordinal from the persisted
       // journal's current maximum (nextBatchOrdinal assigns max + 1 — never
       // from time) and append; the whole read-modify-write runs inside the
       // serialized operation queue, so it is race-free and restart-durable.
       const batch = nextBatchOrdinal(await port.ledgerStorage.readLedgerText());
-      await appendLedgerEntries(journalEntriesForNote(note, port.now(), batch), port.ledgerStorage);
+      const canMutate = (): boolean => isEligible(note.notePath);
+      const guardedLedger: LedgerStoragePort = {
+        readLedgerText: () => port.ledgerStorage.readLedgerText(),
+        writeLedgerText: async (text) => {
+          if (!canMutate()) throw new Error(`note-ineligible: ${note.notePath}`);
+          await port.ledgerStorage.writeLedgerText(text, canMutate);
+        },
+      };
+      await appendLedgerEntries(journalEntriesForNote(note, port.now(), batch), guardedLedger);
     },
   };
   const inline = port.inline;
@@ -97,6 +108,7 @@ function buildSideChannels(port: TaggingCommandPort): ApplySideChannels {
     // and folds every request it receives into one batch; any read failure or
     // stale span answers null and vetoes the note's replacements (content-drift).
     planNoteRewrites: async (notePath, requests) => {
+      if (!isEligible(notePath)) return null;
       const held = sessions.get(notePath);
       if (held !== undefined) return held; // the core plans each note once per call; a repeat hits its session
       try {
@@ -114,12 +126,13 @@ function buildSideChannels(port: TaggingCommandPort): ApplySideChannels {
     // exactly once and ends the session; an unreachable note or failed write is
     // "drifted" too: with no written body, the core's drifted path is the truth.
     commitNoteRewrite: async (notePath) => {
+      if (!isEligible(notePath)) return "drifted";
       const batch = sessions.get(notePath);
       if (batch === undefined) return "drifted"; // no session: nothing was planned for this note
       try {
         const fresh = await inline.readNoteContent(notePath);
         if (fresh !== batch.source) return "drifted"; // the body moved since the plan: never mis-cut
-        await inline.writeNoteContent(notePath, batch.content);
+        await inline.writeNoteContent(notePath, batch.content, () => isEligible(notePath));
         sessions.delete(notePath); // a committed session is never committed twice
         return "committed";
       } catch {
@@ -142,7 +155,18 @@ export async function applySelectedProposals(port: TaggingCommandPort, proposals
   return runSerialized(async () => {
     // Nothing to record after the apply: the per-note write-ahead already
     // journaled everything it let through — a post-apply pass would double-journal.
-    const result = await applyTagProposals(proposals, port.frontmatter, buildSideChannels(port));
+    const isEligible = (notePath: string): boolean => port.isNoteEligible?.(notePath) ?? true;
+    const guardedFrontmatter: ApplyFrontmatterPort = {
+      readNoteTags: async (notePath) => {
+        if (!isEligible(notePath)) throw new Error(`note-ineligible: ${notePath}`);
+        return port.frontmatter.readNoteTags(notePath);
+      },
+      writeNoteTags: async (notePath, tags) => {
+        if (!isEligible(notePath)) throw new Error(`note-ineligible: ${notePath}`);
+        return port.frontmatter.writeNoteTags(notePath, tags, () => isEligible(notePath));
+      },
+    };
+    const result = await applyTagProposals(proposals, guardedFrontmatter, buildSideChannels(port));
     return appliedNotice(result);
   });
 }

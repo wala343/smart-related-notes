@@ -16,7 +16,7 @@
 // from a mulberry32 stream seeded off options.seed.
 // =============================================================================
 
-import type { TaxonomyNode, TaxonomyResult } from "./proposal";
+import type { ConceptTagMembership, TaxonomyNode, TaxonomyResult } from "./proposal";
 // Value imports need the ".ts" specifier for Node's runtime (the test chain has
 // no extension resolution); the expect-error pins the one tsc complaint.
 // @ts-expect-error
@@ -37,6 +37,13 @@ export interface TaxonomyOptions {
   minChildren?: number;         // default 2; descend only when >= this many children are real
   cohesionGain?: number;        // default 0.05; child cohesion must beat parent cohesion by this
   termsPerSegment?: number;     // default 2; terms concatenated into one PascalCase segment
+}
+
+export const CONCEPT_MEMBERSHIP_MIN_SIMILARITY = 0.55;
+export const CONCEPT_MEMBERSHIP_MIN_PEERS = 2;
+
+export interface ConceptMembershipIndex {
+  membershipsFor(notePath: string): ConceptTagMembership[];
 }
 
 interface Ctx {
@@ -90,6 +97,70 @@ function normalise(v: Float32Array): Float32Array {
 function allFinite(v: Float32Array): boolean {
   for (let i = 0; i < v.length; i++) if (!Number.isFinite(v[i])) return false;
   return true;
+}
+
+// Evidence membership is deliberately separate from k-means' one-leaf partition.
+// Each concept needs its own positive similarity to peers, so bridge notes may
+// receive multiple tags while outliers and singleton concepts can abstain.
+export function buildConceptMembershipIndex(
+  taxonomy: TaxonomyResult,
+  input: TaxonomyInputNote[],
+): ConceptMembershipIndex {
+  const vectors = new Map<string, Float32Array>();
+  for (const note of input) {
+    if (note.vec.length > 0 && allFinite(note.vec)) vectors.set(note.path, normalise(note.vec));
+  }
+  const dimensions = vectors.values().next().value?.length ?? 0;
+  const nodes = taxonomy.nodes.map((node) => ({
+    path: joinSegments(node.segments),
+    level: node.level,
+    count: 0,
+    sum: new Float32Array(new ArrayBuffer(dimensions * 4)),
+  }));
+  const nodeByPath = new Map(nodes.map((node) => [node.path, node] as const));
+  for (const [notePath, leafPath] of taxonomy.leafAssignment) {
+    const vector = vectors.get(notePath);
+    if (!vector || vector.length !== dimensions) continue;
+    const segments = leafPath.split("/");
+    for (let level = 1; level <= segments.length; level++) {
+      const node = nodeByPath.get(segments.slice(0, level).join("/"));
+      if (!node) continue;
+      node.count += 1;
+      for (let d = 0; d < dimensions; d++) node.sum[d] += vector[d];
+    }
+  }
+
+  return {
+    membershipsFor(notePath: string): ConceptTagMembership[] {
+      const vector = vectors.get(notePath);
+      const assignedLeaf = taxonomy.leafAssignment.get(notePath);
+      if (!vector || vector.length !== dimensions || assignedLeaf === undefined) return [];
+      const supported: { path: string; level: number; confidence: number; peers: number }[] = [];
+      for (const node of nodes) {
+        const isInNode = assignedLeaf === node.path || assignedLeaf.startsWith(`${node.path}/`);
+        const peers = node.count - (isInNode ? 1 : 0);
+        if (peers < CONCEPT_MEMBERSHIP_MIN_PEERS) continue;
+        const peerSum = new Float32Array(new ArrayBuffer(dimensions * 4));
+        for (let d = 0; d < dimensions; d++) {
+          peerSum[d] = node.sum[d] - (isInNode ? vector[d] : 0);
+        }
+        const similarity = dot(vector, normalise(peerSum));
+        if (similarity < CONCEPT_MEMBERSHIP_MIN_SIMILARITY) continue;
+        supported.push({ path: node.path, level: node.level, confidence: Math.round(similarity * 100) / 100, peers });
+      }
+      // A descendant already expresses its ancestor; keep the deepest supported
+      // concept on each branch without imposing a top-N cap across separate branches.
+      const deepest = supported.filter((candidate) =>
+        !supported.some((other) => other.level > candidate.level && other.path.startsWith(`${candidate.path}/`)),
+      );
+      return deepest.map(({ path, confidence, peers }) => ({
+        notePath,
+        tagPath: path,
+        confidence,
+        evidence: `${Math.round(confidence * 100)}% similarity to ${peers} peer notes in ${path}`,
+      }));
+    },
+  };
 }
 
 // Cluster count for n points: enough groups to be informative, few enough to
@@ -193,6 +264,8 @@ const LABEL_STOP = new Set(
 
 function tokenize(text: string): string[] {
   const out: string[] = [];
+  // Math notation is not concept vocabulary; keep escaped literal dollars as prose.
+  text = text.replace(/\\[\s\S]|\$\$[\s\S]*?\$\$|\$(?:\\[\s\S]|[^$\\])*?\$/g, (match) => match.startsWith("\\") ? match : " ");
   for (const raw of text.toLowerCase().split(/[^\p{L}\p{N}]+/u)) {
     if (raw.length < 3 || LABEL_STOP.has(raw)) continue;
     // Dated tokens (daily notes) would otherwise name a cluster "2026".
@@ -232,6 +305,8 @@ function labelClasses(classTokens: string[][]): string[][] {
     // not read "regression regressions linear".
     const picked: string[] = [];
     for (const { w } of scored) {
+      // Shared sibling vocabulary cannot distinguish a class; a lone class still names by tf.
+      if (classCount >= 2 && docFreq.get(w) === classCount) continue;
       if (!picked.some((p) => p.startsWith(w) || w.startsWith(p))) picked.push(w);
     }
     return picked;
@@ -265,7 +340,7 @@ function segmentFor(
 
 // Cluster `notes` (whose unit vectors are `x`) into children. A candidate is
 // real at minSubClusterSize notes AND cohesionGain over the parent's mean
-// cosine to its centroid; descent happens only with minChildren real ones.
+// cosine to its centroid; descent needs minChildren real, nameable children.
 // Returns null when there is no descent. On the root the parent is virtual
 // (a level-0 node cannot exist), so the retained notes become a sibling node
 // there; elsewhere they stay with the real parent.
@@ -303,12 +378,17 @@ function descend(
   const kids: Kid[] = [];
   classes.forEach((cl, ci) => {
     if (cl.c < k && !real[cl.c]) return; // non-real candidates get no node; their notes stay with the parent
+    if (picks[ci].length === 0) return; // an unnameable class is not a concept; its notes stay with the parent
     kids.push({
       seg: segmentFor(picks[ci], cl.c, ctx.termsPerSegment, used),
       idxs: cl.c === k ? retained : groups[cl.c],
       seed: seedOff * 31 + cl.c + 1, // decorrelate per candidate; any deterministic offset works
     });
   });
+  // minChildren prevents pointless descent, including a split with too few nameable concepts.
+  if (kids.length < ctx.minChildren) return null;
+  // The virtual root cannot retain notes; reject its split so the named whole-vault node holds them.
+  if (root && kids.reduce((count, kid) => count + kid.idxs.length, 0) < notes.length) return null;
   return kids;
 }
 
@@ -377,7 +457,9 @@ export function buildTaxonomy(
   const top = descend(usable, centered, seed, true, ctx);
   if (top === null) {
     // The whole pool is one concept: name it as a single class.
-    const seg = segmentFor(labelClasses([usable.flatMap((n) => tokensOf(n, ctx))])[0], 0, ctx.termsPerSegment, new Set());
+    const picked = labelClasses([usable.flatMap((n) => tokensOf(n, ctx))])[0];
+    if (picked.length === 0) return { nodes: [], leafAssignment: new Map() };
+    const seg = segmentFor(picked, 0, ctx.termsPerSegment, new Set());
     emitNode(usable, unit, [seg], seed, ctx);
   } else {
     top.sort((a, b) => (a.seg < b.seg ? -1 : 1));

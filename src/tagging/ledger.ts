@@ -58,7 +58,7 @@ export interface InlineRevertAccess {
 // reset a journal that might not be empty).
 export interface LedgerStoragePort {
   readLedgerText(): Promise<string | null>;
-  writeLedgerText(text: string): Promise<void>;
+  writeLedgerText(text: string, canMutate?: () => boolean): Promise<void>;
 }
 
 const DAY_MS = 86400000;

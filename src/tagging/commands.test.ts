@@ -435,6 +435,104 @@ void test("concurrent applySelectedProposals calls queue: both land, distinct pe
   assert.deepEqual(journaled(ledger.text), []); // the journal drains, never discarded
 });
 
+void test("eligibility is rechecked after a queued apply reaches the mutation boundary", async () => {
+  const fm = makeFrontmatter({ "notes/first.md": [], "notes/queued.md": [] });
+  const ledger = makeLedger();
+  let releaseFirst!: () => void;
+  let markEntered!: () => void;
+  const firstGate = new Promise<void>((resolve) => { releaseFirst = resolve; });
+  const firstEntered = new Promise<void>((resolve) => { markEntered = resolve; });
+  const firstPort = commandPort(fm.port, {
+    readLedgerText: async () => {
+      markEntered();
+      await firstGate;
+      return ledger.port.readLedgerText();
+    },
+    writeLedgerText: (text) => ledger.port.writeLedgerText(text),
+  });
+  let queuedEligible = true;
+  const queuedPort = commandPort(fm.port, ledger.port, {
+    isNoteEligible: (path) => path !== "notes/queued.md" || queuedEligible,
+  });
+
+  const first = applySelectedProposals(firstPort, [proposal("notes/first.md", "First")]);
+  await firstEntered;
+  const queued = applySelectedProposals(queuedPort, [proposal("notes/queued.md", "Queued")]);
+  queuedEligible = false;
+  releaseFirst();
+
+  assert.equal(await first, "Concept tags: applied 1 proposals to 1 notes, skipped 0.");
+  assert.equal(await queued, "Concept tags: applied 0 proposals to 0 notes, skipped 1.");
+  assert.deepEqual(fm.tags.get("notes/queued.md"), []);
+  assert.deepEqual(journaled(ledger.text).map((row) => row.notePath), ["notes/first.md"]);
+});
+
+void test("exclusion during a delayed ledger read blocks ledger, inline-body and frontmatter writes", async () => {
+  const fm = makeFrontmatter({ "notes/a.md": ["Old"] });
+  const inline = makeInline({ "notes/a.md": "body #Old" }, "live");
+  let eligible = true;
+  let reads = 0;
+  let writes = 0;
+  let release!: () => void;
+  let markEntered!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  const readEntered = new Promise<void>((resolve) => { markEntered = resolve; });
+  const ledger: LedgerStoragePort = {
+    readLedgerText: async () => {
+      reads++;
+      if (reads === 2) {
+        markEntered();
+        await gate;
+      }
+      return null;
+    },
+    writeLedgerText: async () => { writes++; },
+  };
+  const port = commandPort(fm.port, ledger, {
+    inline: inline.access,
+    isNoteEligible: () => eligible,
+  });
+  const pending = applySelectedProposals(port, [proposal("notes/a.md", "New", { replacesTag: "Old" })]);
+  await readEntered;
+  eligible = false;
+  release();
+
+  assert.equal(await pending, "Concept tags: applied 0 proposals to 0 notes, skipped 1.");
+  assert.equal(writes, 0);
+  assert.deepEqual(inline.writes, []);
+  assert.deepEqual(fm.written, []);
+  assert.deepEqual(fm.tags.get("notes/a.md"), ["Old"]);
+});
+
+void test("eligibility changing during a direct apply blocks journal and frontmatter writes, while revert stays available", async () => {
+  const base = makeFrontmatter({ "notes/a.md": ["Existing"] });
+  let eligible = true;
+  const frontmatter: ApplyFrontmatterPort = {
+    readNoteTags: async (path) => {
+      const tags = await base.port.readNoteTags(path);
+      eligible = false;
+      return tags;
+    },
+    writeNoteTags: (path, tags) => base.port.writeNoteTags(path, tags),
+  };
+  const ledger = makeLedger();
+  const port = commandPort(frontmatter, ledger.port, { isNoteEligible: () => eligible });
+  assert.equal(
+    await applySelectedProposals(port, [proposal("notes/a.md", "New")]),
+    "Concept tags: applied 0 proposals to 0 notes, skipped 1.",
+  );
+  assert.deepEqual(base.tags.get("notes/a.md"), ["Existing"]);
+  assert.equal(ledger.text, null);
+
+  const seeded = makeLedger(JSON.stringify([entry({
+    notePath: "notes/a.md", tagPath: "New", addedTags: ["New"], tagsBefore: ["Existing"], tagsAfter: ["Existing", "New"],
+  })]));
+  base.tags.set("notes/a.md", ["Existing", "New"]);
+  assert.equal(await revertTagChanges(commandPort(base.port, seeded.port, { isNoteEligible: () => false })),
+    "Concept tags: reverted 1 changes across 1 notes.");
+  assert.deepEqual(base.tags.get("notes/a.md"), ["Existing"]);
+});
+
 void test("probe3 regression: same-millisecond sequential calls journal distinct ordinals and revert-all restores exactly", async () => {
   // QA probe3's corpse at the commands layer: ONE clock (both calls NOW),
   // city→Urban SECOND and EARLIER in the document with a length change — under

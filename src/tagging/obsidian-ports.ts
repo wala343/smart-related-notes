@@ -42,11 +42,12 @@ export function obsidianFrontmatterPort(app: FrontmatterReading): ApplyFrontmatt
       if (typeof raw === "string") return raw.length > 0 ? [raw] : [];
       return []; // any other value form: the key exists and reads empty; the write normalizes it
     },
-    writeNoteTags: async (notePath: string, tags: string[]): Promise<void> => {
+    writeNoteTags: async (notePath: string, tags: string[], canMutate?: () => boolean): Promise<void> => {
       const file = app.vault.getAbstractFileByPath(notePath);
       if (!file) throw new Error(`note-unavailable: ${notePath}`); // apply's per-note guard skips, never crashes
       // An array value serializes as a YAML block list; every other frontmatter key survives untouched.
       await app.fileManager.processFrontMatter(file, (fm) => {
+        if (canMutate?.() === false) throw new Error(`note-ineligible: ${notePath}`);
         fm.tags = tags;
       });
     },
@@ -58,6 +59,9 @@ export function obsidianFrontmatterPort(app: FrontmatterReading): ApplyFrontmatt
 export function jsonFileLedgerStorage(file: JsonFileAccess): LedgerStoragePort {
   return {
     readLedgerText: async (): Promise<string | null> => ((await file.exists()) ? await file.read() : null),
-    writeLedgerText: (text: string): Promise<void> => file.write(text),
+    writeLedgerText: (text: string, canMutate?: () => boolean): Promise<void> => {
+      if (canMutate?.() === false) return Promise.reject(new Error("note-ineligible"));
+      return file.write(text);
+    },
   };
 }

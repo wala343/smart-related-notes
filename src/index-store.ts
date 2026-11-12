@@ -24,11 +24,10 @@ import {
   type SerializableEntry,
 } from "./vector-math";
 import {
-  joinSegments,
   type TagRewriteProposal,
-  type TaxonomyNode,
   type TaxonomyResult,
 } from "./tagging/proposal";
+import { buildConceptMembershipIndex, type ConceptMembershipIndex } from "./tagging/taxonomy";
 import { renderTaxonomyPreview } from "./tagging/taxonomy-report";
 import {
   cleanTag,
@@ -409,6 +408,14 @@ interface StructuralContext {
   linkTargets: Set<string>; // raw link labels (basename/path, lower-cased)
   ambiguousBasenames: Set<string>; // basenames shared by 2+ files (link-ambiguous)
   frontmatter: Record<string, unknown> | undefined;
+}
+
+interface ConceptProposalContext {
+  membership: ConceptMembershipIndex;
+  detectorProposals: TagRewriteProposal[];
+  tagsByPath: Map<string, Set<string>>;
+  tagDocumentFrequency: Map<string, number>;
+  canonicalTagCase: Map<string, string>;
 }
 
 // =============================================================================
@@ -1012,6 +1019,11 @@ export class IndexStore {
   // (empty corpus), in which case the raw vectors are used unchanged.
   private centroid: Float32Array | null = null;
   private centeredMeans = new Map<string, Float32Array>();
+  private conceptEligiblePaths = new Set<string>();
+  private conceptEligibilityRevision = 0;
+  private activeFileUpdateTokens = new Map<string, object>();
+  private renameRemovalRevision = 0;
+  private persistedRenameRemovalRevision = 0;
 
   // Scale-aware effective chunk cap, set at the start of build() from the vault
   // size. Undefined until the first build, where the getter falls back to the base.
@@ -1055,6 +1067,7 @@ export class IndexStore {
   vaultMapInput(): { path: string; title: string; vec: Float32Array }[] {
     const out: { path: string; title: string; vec: Float32Array }[] = [];
     for (const entry of this.entries.values()) {
+      if (this.isExcluded(entry.path)) continue;
       const vec = this.centeredMean(entry);
       if (!vec || vec.length === 0) continue;
       const base = entry.path.slice(entry.path.lastIndexOf("/") + 1);
@@ -1065,6 +1078,48 @@ export class IndexStore {
       });
     }
     return out;
+  }
+
+  // The concept pipeline's existing eligible universe: indexed notes outside
+  // Templates/ and activated isolated areas. Folder exclusions are already
+  // absent from entries, because they never enter the index.
+  conceptTaxonomyInput(ignore: ReadonlySet<string> = new Set()): { path: string; title: string; vec: Float32Array }[] {
+    return this.vaultMapInput().filter((note) => this.isConceptTagEligible(note.path, ignore));
+  }
+
+  conceptEligibilityKey(): string {
+    return String(this.conceptEligibilityRevision);
+  }
+
+  // Metadata-only tag edits can move a note into or out of an activated isolated
+  // area without changing the indexed path set. Refresh just that membership so
+  // freshness checks stay O(1) instead of rescanning every note and tag.
+  refreshConceptEligibility(path: string): boolean {
+    const wasEligible = this.conceptEligiblePaths.has(path);
+    const isEligible = this.isConceptTagEligible(path);
+    if (wasEligible === isEligible) return false;
+    if (isEligible) this.conceptEligiblePaths.add(path);
+    else this.conceptEligiblePaths.delete(path);
+    this.conceptEligibilityRevision += 1;
+    return true;
+  }
+
+  private rebuildConceptEligibilitySnapshot(): void {
+    const next = new Set<string>();
+    for (const path of this.entries.keys()) {
+      if (this.isConceptTagEligible(path)) next.add(path);
+    }
+    if (
+      next.size === this.conceptEligiblePaths.size &&
+      [...next].every((path) => this.conceptEligiblePaths.has(path))
+    ) return;
+    this.conceptEligiblePaths = next;
+    this.conceptEligibilityRevision += 1;
+  }
+
+  isConceptTagEligible(path: string, ignore: ReadonlySet<string> = new Set()): boolean {
+    return this.entries.has(path) && !this.isExcluded(path) && !ignore.has(path) &&
+      !path.startsWith("Templates/") && this.noteAreas(path).size === 0;
   }
 
   // The shortlist Stage-1 -> Stage-2 funnel width (also the slice width in rank()).
@@ -1140,9 +1195,12 @@ export class IndexStore {
   }
 
   updateOptions(options: IndexStoreOptions): void {
+    const previousScope = `${this.options.excludeFolders.join("\n")}|${this.options.isolatedAreas.join("\n")}`;
     this.options = options;
     // Re-size the dequant LRU when topK/shortlistSize change (clamped to the floor).
     this.dequant.setCap(this.cacheCapFor(options));
+    const nextScope = `${options.excludeFolders.join("\n")}|${options.isolatedAreas.join("\n")}`;
+    if (previousScope !== nextScope) this.rebuildConceptEligibilitySnapshot();
   }
 
   // True while the embedding engine holds a live pipeline. The view uses this to
@@ -1198,6 +1256,7 @@ export class IndexStore {
   ): { file: TFile; semantic: number }[] {
     const scored: { entry: IndexEntry; semantic: number }[] = [];
     for (const entry of this.entries.values()) {
+      if (this.isExcluded(entry.path)) continue;
       if (excludePath !== undefined && entry.path === excludePath) continue;
       if (entry.meanVector.length !== vec.length) continue;
       scored.push({ entry, semantic: cosineSimilarity(vec, entry.meanVector) });
@@ -1473,6 +1532,7 @@ export class IndexStore {
       const { entries } = deserializeIndex(json, blob);
       const loaded = new Map<string, IndexEntry>();
       for (const e of entries) {
+        if (this.isExcluded(e.path)) continue;
         if (e.dims !== header.dims) continue;
         if (e.meanVector.length !== header.dims) continue;
         loaded.set(e.path, {
@@ -1489,6 +1549,7 @@ export class IndexStore {
         });
       }
       this.entries = loaded;
+      this.rebuildConceptEligibilitySnapshot();
       this.dequant.clear();
       this.recomputeCentroid();
       this.labelQueue.clear();
@@ -1522,6 +1583,26 @@ export class IndexStore {
         // ignore — a missing/locked stale file must not block a rebuild.
       }
     }
+  }
+
+  // Empty full persists are commits, not recovery cleanup: every artifact that
+  // still exists must be removed before a rename-removal revision is durable.
+  private async discardPersistedIndex(): Promise<void> {
+    const adapter = this.app.vault.adapter;
+    let firstFailure: Error | undefined;
+    for (const path of [
+      this.jsonPath,
+      this.binPath,
+      this.jsonTmpPath,
+      this.binTmpPath,
+    ]) {
+      try {
+        if (await adapter.exists(path)) await adapter.remove(path);
+      } catch (error) {
+        firstFailure ??= error instanceof Error ? error : new Error(String(error));
+      }
+    }
+    if (firstFailure !== undefined) throw firstFailure;
   }
 
   // Build SerializableEntry[] from the live entries. chunkBytes/scales are already
@@ -1559,17 +1640,26 @@ export class IndexStore {
   // the old manifest — load() validates totalBytes and rebuilds if they skew).
   // ALWAYS call via persist() so it runs under the persistChain mutex.
   private async persistFull(): Promise<void> {
+    // Capture the removal generation beside the exact entry snapshot. A rename
+    // after this synchronous boundary belongs to a later persist, even if this
+    // write has not reached disk yet.
+    const entries = this.serializableEntries();
+    const coveredRenameRemovalRevision = this.renameRemovalRevision;
     // Empty vault (everything excluded, or a brand-new vault): there is nothing to
     // rank and no dims to record. Writing a dims=0 / 0-byte index would only make
     // load()'s `!header.dims` gate treat it as stale and rebuild every startup, so
     // skip the write and clear any prior artifacts instead. An empty build is instant.
-    if (this.entries.size === 0) {
-      await this.discardStaleIndex();
+    if (entries.length === 0) {
+      await this.discardPersistedIndex();
+      this.persistedRenameRemovalRevision = Math.max(
+        this.persistedRenameRemovalRevision,
+        coveredRenameRemovalRevision,
+      );
       return;
     }
-    const dims = this.firstDims();
+    const dims = entries[0].dims;
     const keepText = this.options.showSummary;
-    const { json, blob } = serializeIndex(this.serializableEntries(), {
+    const { json, blob } = serializeIndex(entries, {
       modelId: this.engine.modelId,
       dims,
       hasChunkText: keepText,
@@ -1587,6 +1677,10 @@ export class IndexStore {
     // over an existing destination.
     await this.swapInto(this.binTmpPath, this.binPath);
     await this.swapInto(this.jsonTmpPath, this.jsonPath);
+    this.persistedRenameRemovalRevision = Math.max(
+      this.persistedRenameRemovalRevision,
+      coveredRenameRemovalRevision,
+    );
   }
 
   // Atomically replace `dest` with `tmp`. Obsidian's adapter.rename THROWS when the
@@ -1645,7 +1739,7 @@ export class IndexStore {
   // Public: the reader service respects the same exclusions as the index.
   isExcluded(path: string): boolean {
     return this.options.excludeFolders.some((folder) => {
-      const f = folder.replace(/\/+$/, "");
+      const f = normalizePath(folder).replace(/^\/+|\/+$/g, "");
       if (f.length === 0) return false;
       return path === f || path.startsWith(`${f}/`);
     });
@@ -1906,6 +2000,14 @@ export class IndexStore {
     return run;
   }
 
+  // A scope change must be applied after any already-running build has settled.
+  // build() deliberately coalesces ordinary concurrent requests, so callers that
+  // changed eligibility use this method to guarantee one follow-up reconciliation.
+  async reconcileFiles(): Promise<void> {
+    while (this.buildPromise) await this.buildPromise;
+    await this.build();
+  }
+
   private async buildInner(
     onProgressRaw?: ProgressCallback,
     force = false,
@@ -2043,6 +2145,7 @@ export class IndexStore {
       // Total model failure: notes needed embedding but none succeeded.
       if (attempted > 0 && embedded === 0) {
         this.entries = next;
+        this.rebuildConceptEligibilitySnapshot();
         const detail =
           firstError instanceof Error ? firstError.message : String(firstError);
         this.setProgress({
@@ -2061,6 +2164,7 @@ export class IndexStore {
       }
 
       this.entries = next;
+      this.rebuildConceptEligibilitySnapshot();
       // Ready reports what is IN the index, with the notes that could not be
       // indexed counted apart. Counting every note looked at made a build where
       // 96 of 5,306 notes embedded read as complete.
@@ -2266,44 +2370,61 @@ export class IndexStore {
   // --- incremental updates ---------------------------------------------------
   async updateFile(file: TFile): Promise<void> {
     if (this.closed) return; // unloading: skip the read/chunk work entirely
-    if (this.isExcluded(file.path) || file.extension !== "md") return;
-    // A new file may introduce (or a re-embed of an existing one may not change) a
-    // basename collision; invalidate the cache so the next rank recomputes it.
-    this.ambiguousBasenames = null;
-    if (this.building) {
-      this.pending.add(file.path);
+    if (this.isExcluded(file.path) || file.extension !== "md") {
+      this.removeFile(file.path);
+      await this.persistRenameRemovalIfNeeded();
       return;
     }
-    const entry = await this.embedFile(file);
-    if (entry) {
-      // Mark the vector-mutation window so a concurrent label drain can't write a
-      // manifest that disagrees with the not-yet-rewritten on-disk blob.
-      this.vectorWriteInFlight = true;
-      try {
-        this.entries.set(file.path, entry);
-        this.failedPaths.delete(file.path);
-        this.summaryCache.delete(file.path);
-        // Evict the stale fp32 dequant + label state so ranking/labels recompute.
-        this.dequant.delete(file.path);
-        this.labelQueue.delete(file.path);
-        this.labelDone.delete(file.path);
-        // The corpus shifted by one note; refresh the centroid + centered means
-        // (also resets the dequant cache so chunks re-center against the new centroid).
-        this.recomputeCentroid();
-        this.reportCounts();
-        await this.persist();
-      } finally {
-        this.vectorWriteInFlight = false;
+    const path = file.path;
+    const updateToken = {};
+    this.activeFileUpdateTokens.set(path, updateToken);
+    try {
+      // A new file may introduce (or a re-embed of an existing one may not change) a
+      // basename collision; invalidate the cache so the next rank recomputes it.
+      this.ambiguousBasenames = null;
+      if (this.building) {
+        this.pending.add(path);
+        return;
       }
-    } else if (!this.closed && !this.entries.has(file.path)) {
-      // Not in the index and it could not be embedded now either. A note that
-      // still has its previous entry stays counted as indexed.
-      this.failedPaths.add(file.path);
-      this.reportCounts();
+      const entry = await this.embedFile(file);
+      if (this.activeFileUpdateTokens.get(path) !== updateToken || file.path !== path) return;
+      if (entry) {
+        // Mark the vector-mutation window so a concurrent label drain can't write a
+        // manifest that disagrees with the not-yet-rewritten on-disk blob.
+        this.vectorWriteInFlight = true;
+        try {
+          this.entries.set(path, entry);
+          this.refreshConceptEligibility(path);
+          this.failedPaths.delete(path);
+          this.summaryCache.delete(path);
+          // Evict the stale fp32 dequant + label state so ranking/labels recompute.
+          this.dequant.delete(path);
+          this.labelQueue.delete(path);
+          this.labelDone.delete(path);
+          // The corpus shifted by one note; refresh the centroid + centered means
+          // (also resets the dequant cache so chunks re-center against the new centroid).
+          this.recomputeCentroid();
+          this.reportCounts();
+          await this.persist();
+        } finally {
+          this.vectorWriteInFlight = false;
+        }
+      } else if (!this.closed && !this.entries.has(path)) {
+        // Not in the index and it could not be embedded now either. A note that
+        // still has its previous entry stays counted as indexed.
+        this.failedPaths.add(path);
+        this.reportCounts();
+      }
+      await this.persistRenameRemovalIfNeeded();
+    } finally {
+      if (this.activeFileUpdateTokens.get(path) === updateToken) {
+        this.activeFileUpdateTokens.delete(path);
+      }
     }
   }
 
   removeFile(path: string): void {
+    this.activeFileUpdateTokens.delete(path);
     this.wordCache.delete(path);
     this.summaryCache.delete(path);
     this.dequant.delete(path);
@@ -2313,6 +2434,7 @@ export class IndexStore {
     // A note is never both skipped and indexed, so at most one of these reports.
     if (this.failedPaths.delete(path)) this.reportCounts();
     if (this.entries.delete(path)) {
+      this.refreshConceptEligibility(path);
       this.recomputeCentroid();
       this.reportCounts();
       // The entry set just changed but the on-disk blob hasn't yet; hold the
@@ -2325,16 +2447,39 @@ export class IndexStore {
     }
   }
 
-  renameFile(oldPath: string, file: TFile): void {
+  renameFile(oldPath: string): void {
+    this.activeFileUpdateTokens.delete(oldPath);
     this.wordCache.delete(oldPath);
     this.summaryCache.delete(oldPath);
     this.dequant.delete(oldPath);
     this.labelQueue.delete(oldPath);
     this.labelDone.delete(oldPath);
     this.ambiguousBasenames = null;
-    this.entries.delete(oldPath);
-    this.failedPaths.delete(oldPath);
-    void this.updateFile(file);
+    if (this.failedPaths.delete(oldPath)) this.reportCounts();
+    if (this.entries.delete(oldPath)) {
+      this.refreshConceptEligibility(oldPath);
+      this.recomputeCentroid();
+      this.reportCounts();
+      // The tracked new-path update persists this removal and its replacement
+      // together, avoiding a second vector-write window during a rename.
+      this.renameRemovalRevision += 1;
+    }
+  }
+
+  private async persistRenameRemovalIfNeeded(): Promise<void> {
+    this.vectorWriteInFlight = true;
+    try {
+      while (this.persistedRenameRemovalRevision < this.renameRemovalRevision) {
+        const persistedRevisionBeforeWrite = this.persistedRenameRemovalRevision;
+        await this.persist();
+        // persist() logs and swallows storage failures. Stop after no progress so
+        // a failed adapter cannot create a busy retry loop; the revision remains
+        // pending for the next tracked update.
+        if (this.persistedRenameRemovalRevision === persistedRevisionBeforeWrite) return;
+      }
+    } finally {
+      this.vectorWriteInFlight = false;
+    }
   }
 
   private async flushPending(onProgressRaw?: ProgressCallback): Promise<void> {
@@ -2351,6 +2496,7 @@ export class IndexStore {
           const entry = await this.embedFile(file, onProgress);
           if (entry) {
             this.entries.set(path, entry);
+            this.refreshConceptEligibility(path);
             this.failedPaths.delete(path);
             this.summaryCache.delete(path);
             this.dequant.delete(path);
@@ -2360,6 +2506,8 @@ export class IndexStore {
             this.failedPaths.add(path);
           }
         } else {
+          this.entries.delete(path);
+          this.refreshConceptEligibility(path);
           this.failedPaths.delete(path);
         }
       }
@@ -2613,6 +2761,7 @@ export class IndexStore {
     const selfAreas = this.noteAreas(active.path);
     const shortlist: { entry: IndexEntry; coarse: number }[] = [];
     for (const entry of this.entries.values()) {
+      if (this.isExcluded(entry.path)) continue;
       if (entry.path === active.path) continue;
       if (entry.dims !== self.dims) continue;
       // Isolated areas: a note in an activated area (e.g. the self-contained GoA book)
@@ -2663,7 +2812,7 @@ export class IndexStore {
       for (const nom of nominations) {
         if (already.has(nom.path)) continue;
         const entry = this.entries.get(nom.path);
-        if (!entry || entry.dims !== self.dims) continue;
+        if (!entry || this.isExcluded(entry.path) || entry.dims !== self.dims) continue;
         if (!this.areaMatch(selfAreas, this.noteAreas(nom.path))) continue;
         candidates.push({ entry, coarse: cosineSimilarity(selfMean, this.centeredMean(entry)) });
         already.add(nom.path);
@@ -2814,8 +2963,7 @@ export class IndexStore {
     const inventory: TagInventory = new Map();
     for (const entry of this.entries.values()) {
       const path = entry.path;
-      if (ignore.has(path) || path.startsWith("Templates/")) continue;
-      if (this.noteAreas(path).size > 0) continue; // shared pool only
+      if (!this.isConceptTagEligible(path, ignore)) continue;
       for (const exact of this.noteTagsExact(path)) {
         const canonical = cleanTag(exact).toLowerCase();
         let tag = inventory.get(canonical);
@@ -2833,6 +2981,10 @@ export class IndexStore {
     }
     for (const tag of inventory.values()) tag.notePaths.sort(); // sorted by note path
     return inventory;
+  }
+
+  conceptCarriedTags(path: string): string[] {
+    return [...this.noteTagsExact(path)];
   }
 
   // The ACTIVATED isolated areas a note belongs to: the top-level namespace of each of
@@ -2865,11 +3017,86 @@ export class IndexStore {
     const tagDF = new Map<string, number>();
     const tagsByPath = new Map<string, Set<string>>();
     for (const entry of this.entries.values()) {
+      if (this.isExcluded(entry.path)) continue;
       const ts = this.noteTags(entry.path);
       tagsByPath.set(entry.path, ts);
       for (const t of ts) tagDF.set(t, (tagDF.get(t) ?? 0) + 1);
     }
     return { tagsByPath, tagDF };
+  }
+
+  private conceptProposalContext(taxonomy: TaxonomyResult): ConceptProposalContext {
+    const inventory = this.tagInventory();
+    const { tagsByPath, tagDF } = this.tagCensus();
+    const canonicalTagCase = new Map<string, string>();
+    for (const entry of this.entries.values()) {
+      if (this.isExcluded(entry.path)) continue;
+      for (const exact of this.noteTagsExact(entry.path)) {
+        const key = normalizeTag(exact);
+        if (!canonicalTagCase.has(key)) canonicalTagCase.set(key, exact);
+      }
+    }
+    return {
+      membership: buildConceptMembershipIndex(taxonomy, this.conceptTaxonomyInput()),
+      detectorProposals: [
+        ...detectPlacement(taxonomy, inventory),
+        ...detectNormalization(taxonomy, inventory),
+      ],
+      tagsByPath,
+      tagDocumentFrequency: tagDF,
+      canonicalTagCase,
+    };
+  }
+
+  private conceptProposalsForNoteWithContext(
+    file: TFile,
+    context: ConceptProposalContext,
+  ): TagRewriteProposal[] {
+    if (!this.isConceptTagEligible(file.path)) return [];
+    const proposals: TagRewriteProposal[] = context.membership.membershipsFor(file.path)
+      .map((membership) => ({ kind: "taxonomy" as const, ...membership }));
+    proposals.push(...context.detectorProposals.filter((proposal) => proposal.notePath === file.path));
+    const ranked = this.rank(file);
+    const own = context.tagsByPath.get(file.path) ?? new Set<string>();
+    for (const vote of this.tagVotes(ranked, own, context.tagsByPath, context.tagDocumentFrequency)) {
+      const tagPath = context.canonicalTagCase.get(vote.tag);
+      if (tagPath === undefined) continue;
+      proposals.push({
+        kind: "propagation",
+        notePath: file.path,
+        tagPath,
+        confidence: vote.support / vote.voters,
+        evidence: `${vote.support} of ${vote.voters} nearest neighbours carry this tag`,
+      });
+    }
+    return removeRedundantAdditiveProposals(proposals);
+  }
+
+  // Active-note review uses the same membership, detector inventory and neighbour
+  // vote as a vault review, but ranks only the requested note.
+  async conceptProposalsForNote(file: TFile, taxonomy: TaxonomyResult): Promise<TagRewriteProposal[]> {
+    return this.conceptProposalsForNoteWithContext(file, this.conceptProposalContext(taxonomy));
+  }
+
+  async computeConceptProposalsAsync(
+    taxonomy: TaxonomyResult,
+    onProgress?: (completed: number, total: number) => void,
+  ): Promise<TagRewriteProposal[]> {
+    const context = this.conceptProposalContext(taxonomy);
+    const eligible = [...this.entries.values()].filter((entry) => this.isConceptTagEligible(entry.path));
+    const proposals: TagRewriteProposal[] = [];
+    onProgress?.(0, eligible.length);
+    for (let index = 0; index < eligible.length; index++) {
+      await yieldToUI();
+      while (!this.labelsAllowed() && !this.closed) {
+        await new Promise<void>((resolve) => window.setTimeout(resolve, 50));
+      }
+      if (this.closed) throw new Error("Index closed during tag review");
+      const file = this.app.vault.getAbstractFileByPath(eligible[index].path);
+      if (file instanceof TFile) proposals.push(...this.conceptProposalsForNoteWithContext(file, context));
+      onProgress?.(index + 1, eligible.length);
+    }
+    return proposals;
   }
 
   // The neighbour tag vote — the whole rule lives here so the report rows and
@@ -2929,6 +3156,39 @@ export class IndexStore {
   // pairs win the top slice. Pass a taxonomy and the concept-tag pipeline rides
   // along as conceptProposals + taxonomyPreview.
   computeInsights(ignore: Set<string> = new Set(), taxonomy?: TaxonomyResult): VaultInsights {
+    const sweep = this.insightSlices(ignore, taxonomy);
+    let step = sweep.next();
+    while (!step.done) step = sweep.next();
+    return step.value;
+  }
+
+  // Both entry points drain the SAME ordered sweep. The synchronous API remains
+  // useful for reports/tests; automatic callers yield once per note so input and
+  // paint can run between rank() calls without changing any ranking arithmetic.
+  async computeInsightsAsync(
+    ignore: Set<string> = new Set(),
+    taxonomy?: TaxonomyResult,
+    onProgress?: (completed: number, total: number) => void,
+  ): Promise<VaultInsights> {
+    const total = this.entries.size;
+    let completed = 0;
+    const sweep = this.insightSlices(ignore, taxonomy);
+    onProgress?.(completed, total);
+    for (;;) {
+      await yieldToUI();
+      // Match the lazy-label gate: never rank while the index is being rewritten.
+      // A timer here only defers busy-index work; normal slices use MessageChannel.
+      while (!this.labelsAllowed() && !this.closed) {
+        await new Promise<void>((resolve) => window.setTimeout(resolve, 50));
+      }
+      if (this.closed) throw new Error("Index closed during tag review");
+      const step = sweep.next();
+      if (step.done) return step.value;
+      onProgress?.(++completed, total);
+    }
+  }
+
+  private *insightSlices(ignore: Set<string>, taxonomy?: TaxonomyResult): Generator<void, VaultInsights> {
     const SUGGEST_SIM = 0.5,
       DUP_SIM = 0.68,
       STALE_N = 12,
@@ -2954,7 +3214,7 @@ export class IndexStore {
     const tagDF = new Map<string, number>();
     const tagsByPath = new Map<string, Set<string>>();
     for (const entry of this.entries.values()) {
-      if (ignore.has(entry.path)) continue;
+      if (ignore.has(entry.path) || this.isExcluded(entry.path)) continue;
       const ts = this.noteTags(entry.path);
       tagsByPath.set(entry.path, ts);
       for (const t of ts) tagDF.set(t, (tagDF.get(t) ?? 0) + 1);
@@ -2965,6 +3225,10 @@ export class IndexStore {
     const stale: VaultInsights["stale"] = [];
     const dups: VaultInsights["nearDuplicates"] = [];
     const suggestedTags: VaultInsights["suggestedTags"] = [];
+    const taxonomyProposals: TagRewriteProposal[] = [];
+    const membership = taxonomy
+      ? buildConceptMembershipIndex(taxonomy, this.conceptTaxonomyInput(ignore))
+      : null;
     // Template-shaped notes are neither half of any pair row; the census runs ONCE
     // per sweep, over the same MIN_TEMPLATE_GROUP..size-ceiling window as the
     // de-crowding itself (templateGroups already applies the ceiling).
@@ -2983,7 +3247,7 @@ export class IndexStore {
     // near-dupe claim is the stronger one); the Map keeps first-direction order.
     const sugByKey = new Map<string, VaultInsights["suggestedLinks"][number]>();
     for (const entry of this.entries.values()) {
-      if (ignore.has(entry.path)) continue;
+      if (ignore.has(entry.path) || this.isExcluded(entry.path)) continue;
       stale.push({ path: entry.path, mtime: entry.mtime });
       const file = this.app.vault.getAbstractFileByPath(entry.path);
       const ranked = (file instanceof TFile ? this.rank(file) : []).filter(
@@ -3022,6 +3286,12 @@ export class IndexStore {
       for (const v of this.tagVotes(ranked, own, tagsByPath, tagDF)) {
         suggestedTags.push({ path: entry.path, tag: v.tag, support: v.support, neighbors: v.voters });
       }
+      if (membership && this.isConceptTagEligible(entry.path, ignore)) {
+        for (const row of membership.membershipsFor(entry.path)) {
+          taxonomyProposals.push({ kind: "taxonomy", ...row });
+        }
+      }
+      yield;
     }
     stale.sort((a, b) => a.mtime - b.mtime);
     dups.sort((a, b) => b.score - a.score); // near-dupes keep the plain-score ordering
@@ -3047,24 +3317,11 @@ export class IndexStore {
     // taxonomy: nothing to detect against, so the detector parts stay empty.
     const conceptProposals: TagRewriteProposal[] = [];
     if (taxonomy) {
-      const nodeByPath = new Map<string, TaxonomyNode>();
-      for (const node of taxonomy.nodes) nodeByPath.set(joinSegments(node.segments), node);
-      const leafRows = [...taxonomy.leafAssignment].sort((x, y) =>
-        x[0] < y[0] ? -1 : x[0] > y[0] ? 1 : 0,
+      taxonomyProposals.sort((a, b) =>
+        a.notePath < b.notePath ? -1 : a.notePath > b.notePath ? 1 :
+          a.tagPath < b.tagPath ? -1 : a.tagPath > b.tagPath ? 1 : 0,
       );
-      for (const [notePath, tagPath] of leafRows) {
-        if (ignore.has(notePath) || notePath.startsWith("Templates/")) continue;
-        if (this.noteAreas(notePath).size > 0) continue; // shared pool only
-        const node = nodeByPath.get(tagPath);
-        if (!node) continue; // a leaf path naming no node cannot carry an assignment
-        conceptProposals.push({
-          kind: "taxonomy",
-          notePath,
-          tagPath,
-          confidence: 1,
-          evidence: `assigned to node ${tagPath} (${node.notePaths.length} notes, level ${node.level})`,
-        });
-      }
+      conceptProposals.push(...taxonomyProposals);
       const inventory = this.tagInventory(ignore); // built ONCE; both detectors read it
       conceptProposals.push(
         ...detectPlacement(taxonomy, inventory),
@@ -3080,6 +3337,7 @@ export class IndexStore {
     // order 0001's PascalCase taxonomy paths.
     const canonicalCase = new Map<string, string>();
     for (const entry of this.entries.values()) {
+      if (this.isExcluded(entry.path)) continue;
       for (const exact of this.noteTagsExact(entry.path)) {
         const key = normalizeTag(exact);
         if (!canonicalCase.has(key)) canonicalCase.set(key, exact);
@@ -3098,6 +3356,7 @@ export class IndexStore {
         evidence: `${row.support} of ${row.neighbors} nearest neighbours carry this tag`,
       });
     }
+    const distinctConceptProposals = removeRedundantAdditiveProposals(conceptProposals);
     return {
       total: this.entries.size,
       orphans,
@@ -3105,7 +3364,7 @@ export class IndexStore {
       nearDuplicates: dups.slice(0, DUP_N),
       suggestedLinks: suggested.slice(0, SUGGEST_N),
       suggestedTags: tagRows,
-      conceptProposals,
+      conceptProposals: distinctConceptProposals,
       taxonomyPreview: taxonomy ? renderTaxonomyPreview(taxonomy) : [],
     };
   }
@@ -3594,6 +3853,30 @@ const MIN_TAG_NEIGHBORS = 5; // ignore sparse notes (too few tagged neighbours t
 // (#a/b) are kept whole — a/b and a are distinct, the conservative choice.
 function normalizeTag(tag: string): string {
   return tag.replace(/^#/, "").toLowerCase();
+}
+
+// Additive concept paths form a hierarchy, so suggesting both A and A/B is
+// redundant. Keep the more specific path, and collapse exact additive repeats;
+// reviewed replacement rows remain separate because each names a user tag.
+function removeRedundantAdditiveProposals(proposals: TagRewriteProposal[]): TagRewriteProposal[] {
+  const additiveByNote = new Map<string, string[]>();
+  for (const proposal of proposals) {
+    if (proposal.replacesTag !== undefined && proposal.replacesTag.trim() !== "") continue;
+    const paths = additiveByNote.get(proposal.notePath);
+    if (paths) paths.push(cleanTag(proposal.tagPath).toLowerCase());
+    else additiveByNote.set(proposal.notePath, [cleanTag(proposal.tagPath).toLowerCase()]);
+  }
+  const seen = new Set<string>();
+  return proposals.filter((proposal) => {
+    if (proposal.replacesTag !== undefined && proposal.replacesTag.trim() !== "") return true;
+    const path = cleanTag(proposal.tagPath).toLowerCase();
+    const key = `${proposal.notePath}\n${path}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return !(additiveByNote.get(proposal.notePath) ?? []).some((other) =>
+      other !== path && other.startsWith(`${path}/`),
+    );
+  });
 }
 // Collect note aliases (a frontmatter string or string[]) for the title embed input.
 function addAliases(into: string[], raw: unknown): void {

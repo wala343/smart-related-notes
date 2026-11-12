@@ -44,6 +44,7 @@ type ReaderSvc = InstanceType<typeof ReaderService>; // the class arrives as a v
 // ReaderHost with fixed synthetic returns. own/votes/taxonomy are the knobs a
 // scene turns; `saved` is the saveArtifacts spy.
 interface FakeHost extends ReaderHost {
+  eligible: boolean;
   own: string[];
   votes: TagNeighbour[];
   taxonomy: string[];
@@ -81,6 +82,7 @@ let fetchCalls = 0;
 
 function makeService(): { host: FakeHost; svc: ReaderSvc; engine: FakeEngine } {
   const host: FakeHost = {
+    eligible: true,
     own: [],
     votes: [],
     taxonomy: [],
@@ -89,6 +91,7 @@ function makeService(): { host: FakeHost; svc: ReaderSvc; engine: FakeEngine } {
     vaultRead: async () => NOTE,
     markdownFiles: () => [file],
     fileByPath: (p) => (p === file.path ? file : null),
+    conceptTagEligible: () => host.eligible,
     fileTags: () => host.own,
     neighborPaths: async () => [],
     taxonomyCandidates: () => host.taxonomy,
@@ -233,6 +236,31 @@ await test("coverage cache rule: a covered set serves without recomputing, a new
   assert.equal(host.renders, 2); // one re-render for the seed, one when the fresh pick lands
   assert.deepEqual(lastSaved(host)[file.path].cand, ["Physics/MRI", "Biology/CRISPR", "mri"]); // the new candidate landed in the artifact
   assert.deepEqual(svc.suggestedTags(file.path), ["Physics/MRI", "Biology/CRISPR"]); // now covered: served
+});
+
+await test("an exact candidate cache drops stale tags when evidence shrinks to empty", async () => {
+  const { host, svc, engine } = makeService();
+  host.taxonomy = ["Physics/MRI"];
+  engine.reply = "#Physics/MRI";
+  await computeTags(svc, file);
+  assert.deepEqual(svc.suggestedTags(file.path), ["Physics/MRI"]);
+
+  host.taxonomy = [];
+  assert.deepEqual(svc.suggestedTags(file.path), []);
+  await settle();
+  assert.deepEqual(lastSaved(host)[file.path].cand, []);
+  assert.deepEqual(svc.suggestedTags(file.path), []);
+});
+
+await test("Templates or newly isolated notes stop concept chips without hiding other reader artifacts", async () => {
+  const { host, svc, engine } = makeService();
+  host.taxonomy = ["Physics/MRI"];
+  engine.reply = "#Physics/MRI";
+  await computeTags(svc, file);
+  host.eligible = false;
+  assert.deepEqual(svc.suggestedTags(file.path), []);
+  assert.equal(engine.calls, 1);
+  assert.strictEqual(host.fileByPath(file.path), file, "general reader access remains available");
 });
 
 await test("dismissed stays down: the covered cache never re-serves it", async () => {

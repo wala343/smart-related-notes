@@ -89,6 +89,32 @@ void test("writeNoteTags: a missing note throws — apply turns it into a note-u
   await assert.rejects(() => obsidianFrontmatterPort(app).writeNoteTags("gone.md", ["x"]));
 });
 
+void test("writeNoteTags: eligibility is checked inside a delayed processFrontMatter callback", async () => {
+  const frontmatter = { tags: ["Old"] };
+  let eligible = true;
+  let release!: () => void;
+  let entered!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  const callbackEntered = new Promise<void>((resolve) => { entered = resolve; });
+  const app: FrontmatterReading = {
+    vault: { getAbstractFileByPath: () => ({ path: "a.md" }) },
+    metadataCache: { getFileCache: () => ({ frontmatter }) },
+    fileManager: {
+      processFrontMatter: async (_file, mutate) => {
+        entered();
+        await gate;
+        mutate(frontmatter);
+      },
+    },
+  };
+  const pending = obsidianFrontmatterPort(app).writeNoteTags("a.md", ["New"], () => eligible);
+  await callbackEntered;
+  eligible = false;
+  release();
+  await assert.rejects(pending, /note-ineligible/);
+  assert.deepEqual(frontmatter.tags, ["Old"]);
+});
+
 // One fake JSON file: initial null means the file does not exist yet.
 function makeLedgerFile(initial: string | null) {
   let text = initial;
@@ -127,4 +153,11 @@ void test("jsonFileLedgerStorage: write creates the file", async () => {
   await port.writeLedgerText("[]");
   assert.equal(file.exists(), true);
   assert.equal(await port.readLedgerText(), "[]");
+});
+
+void test("jsonFileLedgerStorage: eligibility is checked at the file write call", async () => {
+  const file = makeLedgerFile(null);
+  let eligible = false;
+  await assert.rejects(jsonFileLedgerStorage(file.access).writeLedgerText("[]", () => eligible), /note-ineligible/);
+  assert.equal(file.exists(), false);
 });
